@@ -183,12 +183,11 @@ def list_live_credentials(
     include_expired: bool = False,
     auto_refresh: bool = True,
 ) -> list[GrokCredentials]:
-    """Return all accounts with tokens (PG primary, auth.json mirror/fallback).
+    """Return all accounts with tokens (PG primary; auth.json only in file mode).
 
-    Do not gate on AUTH_FILE existence: hybrid/PG stores accounts in the DB and
-    the local file is only a best-effort mirror. Short-circuiting on missing
-    auth.json made the pool report zero live credentials after register/import
-    wrote only to PostgreSQL.
+    Do not gate on AUTH_FILE existence: hybrid/PG stores accounts in the DB.
+    Short-circuiting on missing auth.json made the pool report zero live
+    credentials after register/import wrote only to PostgreSQL.
     """
     path = path or AUTH_FILE
     # Request path never network-refreshes here; cache by include_expired only.

@@ -3,6 +3,13 @@
 - Manual probe for a single account (admin UI)
 - Background worker: periodically probe each live account; on hard errors
   block model / disable account and record last_probe on pool meta
+
+Scale notes (many models / large pools):
+- Background cycles rotate ONE model per account per cycle (not accounts×models).
+- Background batch selection is priority-aware: cooldown-due / never-probed /
+  fail-streak first, then fair non-repeat sweep for the rest.
+- Shared httpx client + connection limits avoid per-probe TCP churn.
+- Probe path never reloads the full account_pool state for a single account.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from config import (
     MODEL_HEALTH_INTERVAL,
     MODEL_HEALTH_STARTUP_DELAY,
     MODEL_PROBE_BATCH,
+    MODEL_PROBE_MAX_MODELS_PER_ACCOUNT,
     MODEL_PROBE_WORKERS,
     PROBE_MODELS,
     UPSTREAM_BASE,
@@ -30,6 +38,9 @@ from config import (
 from maintenance_gate import maintenance_slot
 
 _PROBE_TIMEOUT = 30.0
+# Hard ceiling for one maintenance-slot hold (manual_all / background).
+# Prevents multi-model full-pool probes from starving token refresh forever.
+_CYCLE_BUDGET_SEC = 150.0
 
 # Background worker state
 _stop = threading.Event()
@@ -37,6 +48,8 @@ _thread: threading.Thread | None = None
 _wakeup = threading.Event()
 _last_run: dict[str, Any] = {}
 _lock = threading.RLock()
+# Round-robin cursor across PROBE_MODELS for background cycles.
+_model_rr_index = 0
 
 # Strict non-repeat sweep (background only): cover each live account once per
 # sweep generation, then start a new generation. Shared via Redis when multi-
@@ -50,6 +63,151 @@ _local_sweep: dict[str, Any] = {
     "started_at": 0.0,
     "covered": set(),  # type: ignore[dict-item]
 }
+
+# Shared HTTP client for probe workers (connection reuse across accounts).
+# Direct + per-proxy clients so outbound proxy pool can stick per account.
+_http_client: httpx.Client | None = None
+_http_clients_by_proxy: dict[str, httpx.Client] = {}
+_http_client_lock = threading.Lock()
+
+
+def _new_probe_client(*, proxy: str | None = None) -> httpx.Client:
+    limits = httpx.Limits(
+        max_connections=max(8, int(MODEL_PROBE_WORKERS) * 4),
+        max_keepalive_connections=max(4, int(MODEL_PROBE_WORKERS) * 2),
+        keepalive_expiry=30.0,
+    )
+    kwargs: dict[str, Any] = {
+        "timeout": httpx.Timeout(_PROBE_TIMEOUT, connect=10.0),
+        "limits": limits,
+        "http2": False,
+    }
+    proxy_url = (proxy or "").strip()
+    if proxy_url:
+        try:
+            return httpx.Client(proxy=proxy_url, **kwargs)
+        except TypeError:
+            return httpx.Client(
+                proxies={"http://": proxy_url, "https://": proxy_url},
+                **kwargs,
+            )
+    return httpx.Client(**kwargs)
+
+
+def _probe_http_client(account_id: str | None = None) -> httpx.Client:
+    """Lazy shared client — reuses TLS/TCP for dense probe batches.
+
+    When an outbound proxy pool is configured, pins a proxy by account id so
+    probe egress matches live traffic stickiness.
+    """
+    global _http_client
+    proxy_url: str | None = None
+    if account_id:
+        try:
+            from proxy_pool import pick_proxy_for_account
+
+            proxy_url = pick_proxy_for_account(account_id)
+        except Exception:
+            proxy_url = None
+
+    if not proxy_url:
+        with _http_client_lock:
+            if _http_client is None or _http_client.is_closed:
+                _http_client = _new_probe_client()
+            return _http_client
+
+    with _http_client_lock:
+        client = _http_clients_by_proxy.get(proxy_url)
+        if client is None or client.is_closed:
+            client = _new_probe_client(proxy=proxy_url)
+            _http_clients_by_proxy[proxy_url] = client
+            if len(_http_clients_by_proxy) > 32:
+                for old_key in list(_http_clients_by_proxy.keys()):
+                    if old_key == proxy_url:
+                        continue
+                    old = _http_clients_by_proxy.pop(old_key, None)
+                    if old is not None and not old.is_closed:
+                        try:
+                            old.close()
+                        except Exception:
+                            pass
+                    break
+        return client
+
+
+def invalidate_probe_http_client() -> None:
+    """Drop cached probe clients after outbound proxy config changes."""
+    global _http_client
+    with _http_client_lock:
+        clients = []
+        if _http_client is not None:
+            clients.append(_http_client)
+            _http_client = None
+        clients.extend(list(_http_clients_by_proxy.values()))
+        _http_clients_by_proxy.clear()
+    for c in clients:
+        try:
+            if c is not None and not c.is_closed:
+                c.close()
+        except Exception:
+            pass
+
+
+def _normalize_probe_models(models: list[str] | None = None) -> list[str]:
+    """De-dupe + stabilize probe model list (preserve order)."""
+    raw = models if models is not None else (list(PROBE_MODELS) or [DEFAULT_MODEL])
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in raw:
+        mid = str(m or "").strip()
+        if not mid:
+            continue
+        key = mid.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(mid)
+    return out or [DEFAULT_MODEL]
+
+
+def _pick_background_models(models: list[str]) -> list[str]:
+    """Rotate probe models across background cycles.
+
+    With many PROBE_MODELS, probing every model every cycle explodes load
+    (accounts × models). One model per cycle still covers the full list over
+    successive sweeps while keeping each maintenance slot short.
+    """
+    models = _normalize_probe_models(models)
+    if len(models) <= 1:
+        return models
+    global _model_rr_index
+    with _lock:
+        idx = int(_model_rr_index) % len(models)
+        _model_rr_index = (idx + 1) % len(models)
+        return [models[idx]]
+
+
+def _models_for_account(
+    models: list[str],
+    *,
+    source: str,
+    max_models: int | None = None,
+) -> list[str]:
+    """Cap models probed for one account in a single cycle.
+
+    Background already rotates to 1 model. Manual paths may probe several, but
+    still hard-capped so a long PROBE_MODELS list cannot freeze the host.
+    """
+    models = _normalize_probe_models(models)
+    if source == "background":
+        return models[:1] if models else [DEFAULT_MODEL]
+    cap = (
+        max_models
+        if max_models is not None
+        else int(MODEL_PROBE_MAX_MODELS_PER_ACCOUNT or 2)
+    )
+    cap = max(1, min(int(cap), len(models) or 1))
+    return models[:cap]
 
 # Hard signals that this account cannot use the requested model
 # permanently (or for a long TTL). Temporary free-usage / rolling 429s are
@@ -282,11 +440,10 @@ def _save_last_probe(account_id: str | None, result: dict[str, Any], *, overwrit
     if not account_id:
         return
     try:
-        from settings_store import get_account_pool_state, patch_account_pool_meta
+        from settings_store import get_account_pool_meta, patch_account_pool_meta
 
-        # Read existing only to decide overwrite / last_error clear.
-        state = get_account_pool_state()
-        meta = state.get(account_id) or {}
+        # Single-account read only — full-pool load here multiplies with models.
+        meta = get_account_pool_meta(account_id) or {}
         if not isinstance(meta, dict):
             meta = {}
         snap = {
@@ -338,6 +495,7 @@ def probe_model_for_creds(
     auto_disable: bool | None = None,
     source: str = "manual",
     report_stats: bool = True,
+    client: httpx.Client | None = None,
 ) -> dict[str, Any]:
     """Probe one account/model.
 
@@ -439,11 +597,11 @@ def probe_model_for_creds(
             return
         try:
             import account_pool
-            from settings_store import get_account_pool_state
+            from settings_store import get_account_pool_meta
         except Exception:
             return
         try:
-            meta = get_account_pool_state().get(creds.auth_key) or {}
+            meta = get_account_pool_meta(creds.auth_key) or {}
         except Exception:
             meta = {}
         if not isinstance(meta, dict):
@@ -496,39 +654,40 @@ def probe_model_for_creds(
             base["pool_status"] = "normal"
             base["in_cooldown"] = False
 
+    owns_client = client is None
+    http = client or _probe_http_client(creds.auth_key)
     try:
-        with httpx.Client(timeout=_PROBE_TIMEOUT) as client:
-            with client.stream("POST", url, headers=headers, json=body) as resp:
-                status = resp.status_code
-                if status >= 400:
-                    err_text = (resp.read()).decode("utf-8", errors="replace")[:800]
-                    base["status_code"] = status
-                    base["error"] = err_text
-                    base["available"] = False
-                    base["latency_ms"] = int((time.time() - t0) * 1000)
-                    # Do NOT report_failure here — probe is not live traffic.
-                    _apply_fail_status(err_text, status)
-                    _save_last_probe(creds.auth_key, base, overwrite=report_stats)
-                    return base
-
-                got_data = False
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    if isinstance(line, bytes):
-                        line = line.decode("utf-8", errors="replace")
-                    if line.startswith("data:"):
-                        got_data = True
-                        break
-                base["ok"] = True
-                base["available"] = True
+        with http.stream("POST", url, headers=headers, json=body) as resp:
+            status = resp.status_code
+            if status >= 400:
+                err_text = (resp.read()).decode("utf-8", errors="replace")[:800]
                 base["status_code"] = status
-                base["stream_ok"] = got_data
+                base["error"] = err_text
+                base["available"] = False
                 base["latency_ms"] = int((time.time() - t0) * 1000)
-                # Do NOT report_success here — probe is not live traffic.
-                _apply_success_status()
+                # Do NOT report_failure here — probe is not live traffic.
+                _apply_fail_status(err_text, status)
                 _save_last_probe(creds.auth_key, base, overwrite=report_stats)
                 return base
+
+            got_data = False
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", errors="replace")
+                if line.startswith("data:"):
+                    got_data = True
+                    break
+            base["ok"] = True
+            base["available"] = True
+            base["status_code"] = status
+            base["stream_ok"] = got_data
+            base["latency_ms"] = int((time.time() - t0) * 1000)
+            # Do NOT report_success here — probe is not live traffic.
+            _apply_success_status()
+            _save_last_probe(creds.auth_key, base, overwrite=report_stats)
+            return base
     except httpx.HTTPError as e:
         base["error"] = f"network: {e}"
         base["latency_ms"] = int((time.time() - t0) * 1000)
@@ -545,6 +704,9 @@ def probe_model_for_creds(
             _apply_fail_status(base["error"], 502)
         _save_last_probe(creds.auth_key, base, overwrite=report_stats)
         return base
+    finally:
+        # Shared client is never closed here; only caller-owned clients would be.
+        _ = owns_client
 
 
 
@@ -605,6 +767,323 @@ def _unique_live_creds(*, auto_refresh: bool = False) -> list[GrokCredentials]:
 
 def _account_key(c: GrokCredentials) -> str:
     return (c.auth_key or c.user_id or "").strip()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _last_probe_at(meta: dict[str, Any] | None) -> float:
+    """Best-effort last probe timestamp from pool meta / last_probe snapshot."""
+    if not isinstance(meta, dict):
+        return 0.0
+    for key in ("last_probe_ok_at", "last_probe_fail_at"):
+        ts = _safe_float(meta.get(key), 0.0)
+        if ts > 0:
+            return ts
+    snap = meta.get("last_probe")
+    if isinstance(snap, dict):
+        return _safe_float(snap.get("probed_at"), 0.0)
+    return 0.0
+
+
+def _load_probe_priority_meta(
+    creds_list: list[GrokCredentials],
+) -> dict[str, dict[str, Any]]:
+    """Batch-load pool meta used only for background probe ordering.
+
+    Large uncovered sets (thousands+) prefer the warm full pool-state cache so
+    we do not issue a giant multi-id query just to order one batch. Falls back
+    to empty meta when unavailable — selection then degrades to fair sequential
+    sweep (still non-repeat).
+    """
+    ids = [_account_key(c) for c in creds_list if _account_key(c)]
+    if not ids:
+        return {}
+
+    def _from_state(state: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+        if not isinstance(state, dict) or not state:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for aid in ids:
+            meta = state.get(aid)
+            if isinstance(meta, dict):
+                out[aid] = meta  # read-only for sort; no per-row copy
+        return out
+
+    # Prefer warm full-state for big windows; small windows can use many-ids.
+    if len(ids) >= 200:
+        try:
+            from settings_store import get_cached_account_pool_state, get_account_pool_state
+
+            cached = None
+            try:
+                cached = get_cached_account_pool_state()
+            except Exception:
+                cached = None
+            hit = _from_state(cached if isinstance(cached, dict) else None)
+            if hit:
+                return hit
+            hit = _from_state(get_account_pool_state() or {})
+            if hit:
+                return hit
+        except Exception:
+            pass
+
+    try:
+        from settings_store import get_account_pool_meta_many
+
+        raw = get_account_pool_meta_many(ids)
+        if isinstance(raw, dict) and raw:
+            return {
+                str(k): (v if isinstance(v, dict) else {})
+                for k, v in raw.items()
+                if k
+            }
+    except Exception:
+        pass
+    # Full-state fallback (file mode / older stores).
+    try:
+        from settings_store import get_account_pool_state
+
+        return _from_state(get_account_pool_state() or {})
+    except Exception:
+        return {}
+
+
+def _background_probe_priority(
+    creds: GrokCredentials,
+    meta: dict[str, Any] | None,
+    *,
+    now: float,
+) -> tuple[int, float, float, str]:
+    """Lower tuple sorts first for background selection.
+
+    Priority bands (within uncovered set of a sweep generation):
+      0  cooldown due / expired marker — need recovery verification
+      1  never probed — unknown health
+      2  recent probe failure / fail streak — recheck sooner
+      3  normal healthy — fair sweep by oldest probe time
+      9  hard-disabled / quota-disabled — last resort only
+    """
+    aid = _account_key(creds)
+    m = meta if isinstance(meta, dict) else {}
+    enabled = m.get("enabled", True)
+    if enabled is False or bool(m.get("disabled_for_quota")):
+        return (9, 0.0, 0.0, aid)
+
+    last_at = _last_probe_at(m)
+    streak = max(0, _safe_int(m.get("probe_fail_streak"), 0))
+    until = _safe_float(m.get("cooldown_until"), 0.0)
+    count = max(0, _safe_int(m.get("cooldown_count"), 0))
+    stack = m.get("status_stack")
+    stacked = isinstance(stack, list) and len(stack) > 0
+    pool_status = str(m.get("pool_status") or "").strip().lower()
+    last_status = str(m.get("last_probe_status") or "").strip().lower()
+    cooling = (
+        stacked
+        or count > 0
+        or pool_status == "cooldown"
+        or last_status == "cooldown"
+        or (until > 0 and now < until)
+    )
+    # Cooldown whose until marker already elapsed, or count-stack cooling with
+    # no fresh success — verify recovery first so free-usage accounts return.
+    cooldown_due = cooling and (until <= 0 or now >= until or count > 0 or stacked)
+    if cooldown_due:
+        # Oldest due first (until=0 → treat as very due).
+        due_rank = until if until > 0 else 0.0
+        return (0, due_rank, last_at or 0.0, aid)
+
+    if last_at <= 0:
+        return (1, 0.0, 0.0, aid)
+
+    snap = m.get("last_probe")
+    if isinstance(snap, dict) and "ok" in snap:
+        last_ok = bool(snap.get("ok"))
+    elif isinstance(snap, dict) and "available" in snap:
+        last_ok = bool(snap.get("available"))
+    else:
+        last_ok = True
+    if streak > 0 or last_status in ("error", "fail", "failed", "cooldown") or last_ok is False:
+        # Higher streak first, then oldest fail.
+        return (2, -float(streak), last_at, aid)
+
+    # Healthy: oldest successful/checked first so fair full-pool coverage.
+    return (3, last_at, 0.0, aid)
+
+
+def _sort_background_probe_candidates(
+    creds_list: list[GrokCredentials],
+    *,
+    meta_by_id: dict[str, dict[str, Any]] | None = None,
+    now: float | None = None,
+) -> list[GrokCredentials]:
+    """Stable priority sort for background batch selection."""
+    t0 = float(now if now is not None else time.time())
+    metas = meta_by_id if isinstance(meta_by_id, dict) else {}
+    decorated: list[tuple[tuple[Any, ...], GrokCredentials]] = []
+    for c in creds_list:
+        aid = _account_key(c)
+        key = _background_probe_priority(c, metas.get(aid), now=t0)
+        decorated.append((key, c))
+    decorated.sort(key=lambda item: item[0])
+    return [c for _, c in decorated]
+
+
+def _priority_band_counts(
+    creds_list: list[GrokCredentials],
+    *,
+    meta_by_id: dict[str, dict[str, Any]] | None = None,
+    now: float | None = None,
+) -> dict[str, int]:
+    t0 = float(now if now is not None else time.time())
+    metas = meta_by_id if isinstance(meta_by_id, dict) else {}
+    counts = {
+        "cooldown_due": 0,
+        "never_probed": 0,
+        "fail_streak": 0,
+        "healthy": 0,
+        "disabled": 0,
+    }
+    band_to_key = {
+        0: "cooldown_due",
+        1: "never_probed",
+        2: "fail_streak",
+        3: "healthy",
+        9: "disabled",
+    }
+    for c in creds_list:
+        aid = _account_key(c)
+        band = _background_probe_priority(c, metas.get(aid), now=t0)[0]
+        counts[band_to_key.get(band, "healthy")] += 1
+    return counts
+
+
+def _priority_band_of(
+    creds: GrokCredentials,
+    meta: dict[str, Any] | None,
+    *,
+    now: float,
+) -> int:
+    return int(_background_probe_priority(creds, meta, now=now)[0])
+
+
+def _is_recoverable_probe_result(result: dict[str, Any] | None) -> bool:
+    """True when this probe outcome should NOT permanently mark sweep covered.
+
+    Free-usage / rate-limit / still-cooling failures need rechecks inside the
+    same generation; treating them as covered freezes recovery for hours on
+    large pools.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("available"):
+        return False
+    err = str(result.get("error") or "")
+    code = result.get("status_code")
+    try:
+        code_i = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code_i = None
+    if is_temporary_usage_error(err, code_i):
+        return True
+    act = result.get("auto_action") if isinstance(result.get("auto_action"), dict) else {}
+    kick = act.get("probe_kick") if isinstance(act.get("probe_kick"), dict) else {}
+    if kick.get("action") == "cooldown":
+        return True
+    if act.get("in_cooldown") or result.get("in_cooldown"):
+        return True
+    low = err.lower()
+    if "cooldown" in low or "free-usage" in low or "rate limit" in low or "too many" in low:
+        return True
+    return False
+
+
+def _account_probe_aggregate(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Collapse multi-model results into one row per account for sweep decisions."""
+    by_id: dict[str, dict[str, Any]] = {}
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        aid = str(r.get("account_id") or "").strip()
+        if not aid:
+            continue
+        cur = by_id.get(aid)
+        if cur is None:
+            by_id[aid] = dict(r)
+            continue
+        # Prefer available=True if any model succeeded; else keep latest fail.
+        if r.get("available") and not cur.get("available"):
+            by_id[aid] = dict(r)
+        elif (not cur.get("available")) and (not r.get("available")):
+            # Prefer recoverable signal so we do not over-cover.
+            if _is_recoverable_probe_result(r) and not _is_recoverable_probe_result(cur):
+                by_id[aid] = dict(r)
+            else:
+                by_id[aid] = dict(r)
+    return by_id
+
+
+def _pick_priority_reserved_batch(
+    remaining_sorted: list[GrokCredentials],
+    *,
+    max_accounts: int,
+    meta_by_id: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> list[GrokCredentials]:
+    """Reserve part of each cycle for recovery/unknown before healthy fair-scan.
+
+    Without a reservation, a giant healthy uncovered set can starve cooldown
+    recovery for many cycles even though priority sort puts them first — if
+    those cool accounts were already marked covered earlier in the generation.
+    Re-admission of recoverable ids (see probe_account_models) pairs with this.
+    """
+    n = max(0, int(max_accounts or 0))
+    if n <= 0 or not remaining_sorted:
+        return []
+    # ~60% of the batch for recovery bands, rest for fair healthy/disabled.
+    reserved = max(1, min(n, int(round(n * 0.6)))) if n >= 2 else n
+    recovery: list[GrokCredentials] = []
+    rest: list[GrokCredentials] = []
+    metas = meta_by_id if isinstance(meta_by_id, dict) else {}
+    for c in remaining_sorted:
+        band = _priority_band_of(c, metas.get(_account_key(c)), now=now)
+        if band in (0, 1, 2):
+            recovery.append(c)
+        else:
+            rest.append(c)
+    out: list[GrokCredentials] = []
+    out.extend(recovery[:reserved])
+    if len(out) < n:
+        out.extend(rest[: n - len(out)])
+    # If recovery was smaller than reserved, fill from remaining recovery tail
+    # then rest already handled; if still short, append leftover recovery.
+    if len(out) < n:
+        seen = {_account_key(c) for c in out}
+        for c in recovery[reserved:] + rest:
+            aid = _account_key(c)
+            if aid in seen:
+                continue
+            out.append(c)
+            seen.add(aid)
+            if len(out) >= n:
+                break
+    return out[:n]
 
 
 def _sweep_ttl() -> int:
@@ -751,8 +1230,9 @@ def _select_probe_batch(
     """Pick up to max_accounts for this cycle.
 
     Background source uses a strict non-repeat sweep: each live account is
-    probed at most once per generation. When all live accounts are covered (or
-    only disabled leftovers remain), a new generation starts.
+    probed at most once per generation. Within the uncovered set, order is
+    priority-aware so multi-k/10k pools recover cooldown / unknown accounts
+    before re-checking healthy ones. Manual full probe stays sequential.
     """
     info: dict[str, Any] = {
         "mode": "priority",
@@ -761,6 +1241,7 @@ def _select_probe_batch(
         "sweep_live": len(creds_list),
         "sweep_remaining": len(creds_list),
         "sweep_reset": False,
+        "priority": None,
     }
     if max_accounts <= 0 or not creds_list:
         return [], info
@@ -777,7 +1258,7 @@ def _select_probe_batch(
         info["sweep_remaining"] = max(0, len(ordered) - max_accounts)
         return ordered[:max_accounts], info
 
-    # ── strict sweep ──────────────────────────────────────────────────────
+    # ── strict sweep + priority within uncovered ──────────────────────────
     live_ids = [_account_key(c) for c in creds_list if _account_key(c)]
     live_set = set(live_ids)
     gen, covered, started = _sweep_load()
@@ -787,31 +1268,79 @@ def _select_probe_batch(
 
     # Drop covered ids that no longer exist (deleted accounts).
     covered = {x for x in covered if x in live_set}
+
+    now = time.time()
+    # Read meta for the full live set so cooldown accounts already marked
+    # covered can be re-admitted for recovery verification.
+    meta_all = _load_probe_priority_meta(creds_list)
     remaining = [c for c in creds_list if _account_key(c) not in covered]
 
-    # If nothing left, start a new sweep generation.
-    if not remaining:
+    # Re-admit covered accounts that still look cooldown/fail-recoverable and
+    # have not been probed too recently (avoid hot-looping the same 429s).
+    recheck_min_age = max(60.0, float(MODEL_HEALTH_INTERVAL or 300.0) * 0.5)
+    re_admit: list[GrokCredentials] = []
+    for c in creds_list:
+        aid = _account_key(c)
+        if not aid or aid not in covered:
+            continue
+        meta = meta_all.get(aid) or {}
+        band = _priority_band_of(c, meta, now=now)
+        if band not in (0, 2):
+            continue
+        last_at = _last_probe_at(meta)
+        if last_at > 0 and (now - last_at) < recheck_min_age:
+            continue
+        re_admit.append(c)
+
+    # If nothing left (and no re-admit), start a new sweep generation.
+    if not remaining and not re_admit:
         gen, covered, started = _sweep_start_new(live_ids)
         remaining = list(creds_list)
+        re_admit = []
         info["sweep_reset"] = True
         print(
             f"  [model-health] sweep reset gen={gen} live={len(live_ids)} "
             f"(previous generation fully covered)"
         )
+        # New generation: refresh meta window.
+        meta_all = _load_probe_priority_meta(remaining)
 
-    # Within uncovered set: sequential from first account id (deterministic scan).
-    remaining_sorted = sorted(
-        remaining, key=lambda c: (c.auth_key or c.user_id or c.email or "")
+    # Merge remaining + re-admit (dedupe), then priority sort.
+    merged: list[GrokCredentials] = []
+    seen_ids: set[str] = set()
+    for c in re_admit + remaining:
+        aid = _account_key(c)
+        if not aid or aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        merged.append(c)
+
+    remaining_sorted = _sort_background_probe_candidates(
+        merged, meta_by_id=meta_all, now=now
     )
-    batch = remaining_sorted[:max_accounts]
+    batch = _pick_priority_reserved_batch(
+        remaining_sorted,
+        max_accounts=max_accounts,
+        meta_by_id=meta_all,
+        now=now,
+    )
+    batch_priority = _priority_band_counts(batch, meta_by_id=meta_all, now=now)
+    remaining_priority = _priority_band_counts(
+        remaining_sorted, meta_by_id=meta_all, now=now
+    )
     info.update(
         {
-            "mode": "strict_sweep",
+            "mode": "priority_sweep",
             "sweep_generation": gen,
             "sweep_covered": len(covered),
             "sweep_live": len(live_ids),
             "sweep_remaining": max(0, len(remaining_sorted) - len(batch)),
             "sweep_started_at": started or None,
+            "re_admit": len(re_admit),
+            "priority": {
+                "batch": batch_priority,
+                "remaining": remaining_priority,
+            },
         }
     )
     return batch, info
@@ -825,9 +1354,25 @@ def probe_account_models(
     source: str = "manual",
     max_workers: int | None = None,
     max_accounts: int | None = None,
+    max_models_per_account: int | None = None,
+    cycle_budget_sec: float | None = None,
 ) -> dict[str, Any]:
-    """Probe one or all accounts for model availability (concurrency-capped)."""
-    models = models or list(PROBE_MODELS) or [DEFAULT_MODEL]
+    """Probe one or all accounts for model availability (concurrency-capped).
+
+    Background source rotates a single model per cycle to avoid accounts×models
+    explosion when PROBE_MODELS is long. Manual paths may probe a small cap of
+    models per account, still sequential per account so one bad model cannot
+    multiply concurrent load for the same token.
+    """
+    all_models = _normalize_probe_models(models)
+    if source == "background":
+        # One model per background cycle — full list covered across cycles.
+        cycle_models = _pick_background_models(all_models)
+    else:
+        cycle_models = _models_for_account(
+            all_models, source=source, max_models=max_models_per_account
+        )
+
     sweep_info: dict[str, Any] = {}
     if account_id:
         creds_list = [load_credentials_by_id(account_id)]
@@ -855,52 +1400,110 @@ def probe_account_models(
             deferred = int(sweep_info.get("sweep_remaining") or 0)
 
     results: list[dict[str, Any]] = []
-
-    def _probe_one(args: tuple[GrokCredentials, str]) -> dict[str, Any]:
-        creds, model = args
-        return probe_model_for_creds(
-            creds, model, auto_disable=auto_disable, source=source
-        )
-
-    tasks = [(creds, model) for creds in creds_list for model in models]
-    workers = max_workers if max_workers is not None else MODEL_PROBE_WORKERS
-    workers = min(int(workers), max(1, len(tasks))) if tasks else 1
-    if tasks:
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="model-probe-"
-        ) as ex:
-            for fut in as_completed(ex.submit(_probe_one, t) for t in tasks):
-                try:
-                    results.append(fut.result())
-                except Exception as e:  # noqa: BLE001
-                    results.append({
+    budget = (
+        float(cycle_budget_sec)
+        if cycle_budget_sec is not None
+        else float(_CYCLE_BUDGET_SEC)
+    )
+    budget = max(15.0, budget)
+    deadline = time.time() + budget
+    budget_hit = False
+    def _probe_account(creds: GrokCredentials) -> list[dict[str, Any]]:
+        """Probe models for one account sequentially (same token, less stampede)."""
+        # Per-account client so outbound proxy stickiness matches live traffic.
+        account_client = _probe_http_client(creds.auth_key)
+        out: list[dict[str, Any]] = []
+        for model in cycle_models:
+            if time.time() >= deadline:
+                break
+            try:
+                out.append(
+                    probe_model_for_creds(
+                        creds,
+                        model,
+                        auto_disable=auto_disable,
+                        source=source,
+                        client=account_client,
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                out.append(
+                    {
                         "ok": False,
                         "available": False,
+                        "account_id": creds.auth_key,
+                        "email": creds.email,
+                        "model": model,
                         "error": str(e)[:300],
                         "source": source,
                         "probed_at": time.time(),
-                    })
+                    }
+                )
+        return out
 
-    # Mark covered after probes complete (even if probe failed — still "checked").
+    # Parallelize across accounts; models for one account stay sequential.
+    workers = max_workers if max_workers is not None else MODEL_PROBE_WORKERS
+    workers = min(int(workers), max(1, len(creds_list))) if creds_list else 1
+    skipped_accounts = 0
+    if creds_list:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="model-probe-"
+        ) as ex:
+            futures = []
+            for c in creds_list:
+                if time.time() >= deadline:
+                    budget_hit = True
+                    skipped_accounts += 1
+                    continue
+                futures.append(ex.submit(_probe_account, c))
+            for fut in as_completed(futures):
+                try:
+                    results.extend(fut.result())
+                except Exception as e:  # noqa: BLE001
+                    results.append(
+                        {
+                            "ok": False,
+                            "available": False,
+                            "error": str(e)[:300],
+                            "source": source,
+                            "probed_at": time.time(),
+                        }
+                    )
+                if time.time() >= deadline:
+                    budget_hit = True
+
+    # Mark covered after probes complete.
+    # Recoverable free-usage / rate-limit failures stay UNcovered so the same
+    # generation can re-check them after a cool-down gap (see re_admit path).
+    # Only mark accounts we actually attempted so budget-cut leftovers stay pending.
     if source == "background" and not account_id:
-        tried_ids = []
-        for c in creds_list:
-            kid = _account_key(c)
-            if kid:
-                tried_ids.append(kid)
-        # Also include any result account_id in case list drifted
-        for r in results:
-            aid = r.get("account_id")
-            if aid and str(aid) not in tried_ids:
-                tried_ids.append(str(aid))
-        covered_total = _sweep_mark_covered(tried_ids)
-        if sweep_info is not None:
-            sweep_info["sweep_covered"] = covered_total
-            # remaining after mark ≈ live - covered (best-effort)
-            live_n = int(sweep_info.get("sweep_live") or 0)
-            if live_n:
-                sweep_info["sweep_remaining"] = max(0, live_n - covered_total)
-                deferred = int(sweep_info["sweep_remaining"])
+        by_account = _account_probe_aggregate(results)
+        cover_ids: list[str] = []
+        hold_ids: list[str] = []
+        for aid, row in by_account.items():
+            if _is_recoverable_probe_result(row):
+                hold_ids.append(aid)
+            else:
+                cover_ids.append(aid)
+        # If no results (all skipped by budget), do not advance sweep.
+        if cover_ids:
+            covered_total = _sweep_mark_covered(cover_ids)
+            if sweep_info is not None:
+                sweep_info["sweep_covered"] = covered_total
+                live_n = int(sweep_info.get("sweep_live") or 0)
+                if live_n:
+                    sweep_info["sweep_remaining"] = max(0, live_n - covered_total)
+                    deferred = int(sweep_info["sweep_remaining"])
+                sweep_info["held_recoverable"] = len(hold_ids)
+        elif hold_ids and sweep_info is not None:
+            sweep_info["held_recoverable"] = len(hold_ids)
+        elif budget_hit and sweep_info is not None:
+            # Keep previous remaining estimate when nothing ran.
+            deferred = int(sweep_info.get("sweep_remaining") or deferred)
+
+    if budget_hit:
+        # Accounts we intended to probe this cycle but skipped due to budget.
+        deferred = int(deferred or 0) + int(skipped_accounts)
 
     available = sum(1 for r in results if r.get("available"))
     blocked = sum(
@@ -909,13 +1512,17 @@ def probe_account_models(
     out = {
         "ok": True,
         "probed_at": time.time(),
-        "models": models,
+        "models": cycle_models,
+        "models_configured": all_models,
+        "models_per_account": len(cycle_models),
         "count": len(results),
         "available_count": available,
         "unavailable_count": len(results) - available,
         "auto_action_count": blocked,
         "deferred": deferred,
         "workers": workers,
+        "budget_sec": budget,
+        "budget_hit": budget_hit,
         "results": results,
         "source": source,
     }
@@ -990,19 +1597,42 @@ def run_once(*, source: str = "background") -> dict[str, Any]:
             if source == "background":
                 print("  [model-health] deferred: maintenance slot busy")
             return result
+        # Reclaim free-usage / temporary cooldowns whose wall-clock TTL elapsed
+        # so pool_status does not stay "cooldown" after the window ends.
+        try:
+            import account_pool as _ap
+
+            expired = _ap.expire_due_cooldowns(limit=300)
+            if expired.get("cleared"):
+                print(
+                    f"  [model-health] expired cooldowns cleared="
+                    f"{expired.get('cleared')} scanned={expired.get('scanned')}"
+                )
+        except Exception:
+            pass
         # Prefer accounts that look unhealthy / never probed so kicks land faster.
         workers = None
+        # Keep cycles inside maintenance lock budget even with many models.
+        cycle_budget = float(_CYCLE_BUDGET_SEC)
         if source == "manual_all":
             try:
                 workers = max(int(MODEL_PROBE_WORKERS), min(8, int(MODEL_PROBE_WORKERS) * 2))
             except Exception:
                 workers = MODEL_PROBE_WORKERS
+            # Admin full probe may run longer, still below lock timeout.
+            try:
+                from config import MAINTENANCE_LOCK_TIMEOUT as _mlt
+
+                cycle_budget = min(max(60.0, float(_mlt) * 0.8), 240.0)
+            except Exception:
+                cycle_budget = 150.0
         result = probe_account_models(
             None,
             list(PROBE_MODELS) or [DEFAULT_MODEL],
             auto_disable=True,
             source=source,
             max_workers=workers,
+            cycle_budget_sec=cycle_budget,
         )
         try:
             import account_pool
@@ -1117,11 +1747,21 @@ def run_once(*, source: str = "background") -> dict[str, Any]:
     if bad or result.get("deferred") or kick_cd or kick_dis or sweep:
         sw = ""
         if sweep:
+            pr = (sweep.get("priority") or {}).get("batch") or {}
+            pr_txt = ""
+            if pr:
+                pr_txt = (
+                    f" prio[cd={pr.get('cooldown_due', 0)}"
+                    f"/new={pr.get('never_probed', 0)}"
+                    f"/fail={pr.get('fail_streak', 0)}"
+                    f"/ok={pr.get('healthy', 0)}]"
+                )
             sw = (
                 f" sweep={sweep.get('mode')} gen={sweep.get('sweep_generation')} "
                 f"covered={sweep.get('sweep_covered')}/{sweep.get('sweep_live')} "
                 f"left={sweep.get('sweep_remaining')}"
                 + (" reset" if sweep.get("sweep_reset") else "")
+                + pr_txt
             )
         print(
             f"  [model-health] cycle: {result.get('available_count')}/"
@@ -1261,7 +1901,7 @@ def status(*, light: bool = False) -> dict[str, Any]:
     try:
         gen, covered, started = _sweep_load()
         sweep = {
-            "mode": "strict_sweep",
+            "mode": "priority_sweep",
             "generation": gen or None,
             "covered": len(covered),
             "started_at": started or None,
@@ -1274,8 +1914,29 @@ def status(*, light: bool = False) -> dict[str, Any]:
                 sweep["remaining"] = sw.get("sweep_remaining")
                 if sw.get("sweep_covered") is not None:
                     sweep["covered"] = sw.get("sweep_covered")
+                if sw.get("mode"):
+                    sweep["mode"] = sw.get("mode")
+                if isinstance(sw.get("priority"), dict):
+                    sweep["priority"] = sw.get("priority")
     except Exception:
         sweep = None
+    # Rough ETA for full-pool coverage under current batch/interval caps.
+    # Useful for large pools (thousands+) so operators can tune workers/batch.
+    eta_sec = None
+    try:
+        live_n = None
+        if isinstance(sweep, dict) and sweep.get("live") is not None:
+            live_n = int(sweep.get("live") or 0)
+        elif isinstance(last, dict):
+            sw = last.get("sweep") if isinstance(last.get("sweep"), dict) else {}
+            if sw.get("sweep_live") is not None:
+                live_n = int(sw.get("sweep_live") or 0)
+        batch_n = max(1, int(MODEL_PROBE_BATCH or 1))
+        if live_n and live_n > 0 and interval > 0:
+            cycles = (live_n + batch_n - 1) // batch_n
+            eta_sec = float(cycles) * float(interval)
+    except Exception:
+        eta_sec = None
     return {
         "running": bool(cluster_running),
         "local_running": local_running,
@@ -1290,6 +1951,11 @@ def status(*, light: bool = False) -> dict[str, Any]:
         "probe_workers": MODEL_PROBE_WORKERS,
         "probe_batch": MODEL_PROBE_BATCH,
         "probe_models": list(PROBE_MODELS) or [DEFAULT_MODEL],
+        # Background rotates 1 model/cycle; manual probes cap models/account.
+        "probe_models_per_cycle": 1,
+        "probe_max_models_per_account": int(MODEL_PROBE_MAX_MODELS_PER_ACCOUNT or 2),
         "auto_disable": MODEL_HEALTH_AUTO_DISABLE,
         "sweep": sweep,
+        "full_pool_eta_sec": eta_sec,
+        "selection": "priority_sweep",
     }

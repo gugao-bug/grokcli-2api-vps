@@ -234,8 +234,8 @@ def _cleanup_account_side_state(account_ids: list[str]) -> None:
         pass
 
 
-# File-mode safety net only. When PostgreSQL is primary, auth.json is a mirror
-# and point-in-time recovery should come from PG / export — not local bak spam.
+# File-mode safety net only. When PostgreSQL is primary, auth.json is not used
+# at runtime — recovery is PG / admin export, not local .bak spam.
 _AUTH_BAK_KEEP = 5
 
 
@@ -295,7 +295,7 @@ def remove_account(account_id: str) -> bool:
         return False
     _backup_auth_file()
     del data[matched]
-    write_auth_map(data)  # PG primary + file mirror
+    write_auth_map(data)  # PG primary (no auth.json mirror)
     _cleanup_account_side_state([matched, account_id])
     return True
 
@@ -319,7 +319,7 @@ def remove_accounts(account_ids: list[str]) -> dict:
         removed.append(matched)
     if removed:
         _backup_auth_file()
-        write_auth_map(data)  # PG primary + file mirror
+        write_auth_map(data)  # PG primary (no auth.json mirror)
         _cleanup_account_side_state(removed)
     return {
         "removed": removed,
@@ -331,13 +331,13 @@ def remove_accounts(account_ids: list[str]) -> dict:
 
 
 def clear_all_accounts() -> bool:
-    """Clear every account from durable store (PostgreSQL + local file mirror)."""
+    """Clear every account from durable store (PostgreSQL, or auth.json in file mode)."""
     _backup_auth_file()
     try:
         # Empty map → PG write_auth_map deletes all account + pool rows.
         write_auth_map({})
     except Exception:
-        # Fallback: try file-only wipe
+        # Fallback: try file-only wipe (file mode / PG unavailable)
         try:
             if AUTH_FILE.is_file():
                 AUTH_FILE.unlink()
@@ -378,12 +378,14 @@ def clear_all_accounts() -> bool:
         invalidate_pool_summary_cache()
     except Exception:
         pass
-    # Keep empty local file for tools that still look at AUTH_FILE
-    try:
-        AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-        AUTH_FILE.write_text("{}", encoding="utf-8")
-    except OSError:
-        pass
+    # File mode only: leave an empty auth.json so tools that open AUTH_FILE don't 404.
+    # Hybrid/PG mode never depends on this file at runtime.
+    if _auth_file_is_primary():
+        try:
+            AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+            AUTH_FILE.write_text("{}", encoding="utf-8")
+        except OSError:
+            pass
     return True
 
 
@@ -436,11 +438,11 @@ def start_login(mode: str = "device", *, capture: bool | None = None) -> dict[st
 
 
 def run_logout() -> dict[str, Any]:
-    """Clear all accounts from durable store (PostgreSQL + local mirror)."""
+    """Clear all accounts from durable store (PostgreSQL, or auth.json in file mode)."""
     ok = clear_all_accounts()
     return {
         "ok": ok,
-        "message": "已清空数据库账号池与本地镜像" if ok else "清空账号池失败",
+        "message": "已清空账号池" if ok else "清空账号池失败",
     }
 
 
@@ -969,16 +971,8 @@ def import_auth_payload(
             invalidate_pool_summary_cache()
         except Exception:
             pass
-        # Best-effort local mirror for export/tools only (do not rewrite PG again —
-        # accounts were already upserted row-by-row above). Runtime reads PG;
-        # missing auth.json must not gate live credentials.
-        try:
-            from auth_store import _write_auth_file, auth_lock
-
-            with auth_lock():
-                _write_auth_file(read_auth_map(), AUTH_FILE)
-        except Exception:
-            pass
+        # Runtime authority is PostgreSQL — no auth.json mirror write after import.
+        # Admin export serializes from PG on demand.
         total = 0
         try:
             from store.accounts_pg import count_accounts
@@ -991,6 +985,7 @@ def import_auth_payload(
             "message": f"已导入 {len(imported)} 个账号到 PostgreSQL（多账号合并={merge}）",
             "imported": imported,
             "auth_file": str(AUTH_FILE),
+            "auth_file_role": "export_only",
             "storage": "postgres",
             "total_accounts": total,
         }

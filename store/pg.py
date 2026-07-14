@@ -182,6 +182,25 @@ _SCHEMA_MIGRATIONS = (
     "CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events (model, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_protocol ON usage_events (protocol, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_client_ip ON usage_events (client_ip, created_at DESC)",
+    # Upstream model catalog (synced from cli-chat-proxy /v1/models).
+    """
+    CREATE TABLE IF NOT EXISTS models (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      description TEXT,
+      owned_by TEXT NOT NULL DEFAULT 'xai',
+      hidden BOOLEAN NOT NULL DEFAULT false,
+      synthetic BOOLEAN NOT NULL DEFAULT false,
+      context_window BIGINT,
+      supports_reasoning_effort BOOLEAN,
+      extra JSONB NOT NULL DEFAULT '{}'::jsonb,
+      sort_order INT NOT NULL DEFAULT 100,
+      fetched_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_models_hidden ON models (hidden)",
+    "CREATE INDEX IF NOT EXISTS idx_models_sort ON models (sort_order, id)",
 )
 
 

@@ -125,23 +125,12 @@ def _load_raw() -> dict[str, Any]:
 
 
 def _save_raw(data: dict[str, Any]) -> None:
-    """Persist key list. PostgreSQL is primary; always mirror to local keys.json."""
+    """Persist key list. PostgreSQL is primary; keys.json only in file mode."""
     keys = list(data.get("keys") or [])
     pg = _pg_keys()
     if pg is not None:
         try:
             pg.replace_all(keys)
-            # Mirror file for backup/export tools (best-effort).
-            try:
-                _ensure_parent(KEYS_FILE)
-                tmp = KEYS_FILE.with_suffix(".tmp")
-                tmp.write_text(
-                    json.dumps({"keys": keys}, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                tmp.replace(KEYS_FILE)
-            except Exception:
-                pass
             return
         except Exception:
             pass
@@ -201,7 +190,7 @@ def create_key(name: str, note: str = "") -> dict[str, Any]:
     with _lock:
         data = _load_raw()
         data["keys"].append(row)
-        _save_raw(data)  # PG replace_all + file mirror
+        _save_raw(data)  # PG replace_all (or keys.json in file mode)
         _cache_invalidate()
     out = rec.public_dict()
     out["key"] = raw  # alias for older admin UI
@@ -257,9 +246,6 @@ def delete_key(key_id: str) -> bool:
             try:
                 ok = bool(pg.delete(key_id))
                 if ok:
-                    # rebuild file mirror from remaining rows
-                    remaining = pg.list_raw()
-                    _save_raw({"keys": remaining})
                     _cache_invalidate()
                 return ok
             except Exception:

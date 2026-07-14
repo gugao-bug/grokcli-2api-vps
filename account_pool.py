@@ -82,6 +82,13 @@ COOLDOWN_JITTER_RATIO = 0.15  # +/-15% jitter to desync herd recovery
 PROBE_FAIL_KICK_STREAK = 2
 PROBE_FAIL_DISABLE_STREAK = 4
 PROBE_KICK_COOLDOWN_SEC = 600.0
+# free-usage (rolling 24h) recovery knobs.
+# Base wait after first free-usage hit; grows with stack but hard-capped so
+# accounts do not stay "cooling" forever after cooldown_until expires.
+FREE_USAGE_COOLDOWN_BASE_SEC = 900.0   # 15m first hit
+FREE_USAGE_COOLDOWN_MAX_SEC = 3600.0   # 1h hard cap (rolling windows recover)
+FREE_USAGE_STACK_MAX = 4              # stop stacking past this; just refresh until
+FREE_USAGE_RESTACK_MIN_SEC = 120.0    # ignore duplicate free-usage within this window
 
 _lock = threading.RLock()
 _rr_index = 0
@@ -190,6 +197,19 @@ def stack_status_entry(
     return stack
 
 
+def _free_usage_cooldown_ttl(stack_count: int) -> float:
+    """Bounded exponential-ish wait for free-usage hits.
+
+    count=1 → base; then +50% each stack, hard-capped so rolling free tiers
+    re-enter the pool within FREE_USAGE_COOLDOWN_MAX_SEC.
+    """
+    n = max(1, int(stack_count or 1))
+    base = float(FREE_USAGE_COOLDOWN_BASE_SEC)
+    # 1→base, 2→1.5x, 3→2.25x, 4→~3.4x … then clamp.
+    ttl = base * (1.5 ** max(0, n - 1))
+    return max(60.0, min(float(FREE_USAGE_COOLDOWN_MAX_SEC), float(ttl)))
+
+
 def apply_free_usage_cooldown(
     account_id: str,
     *,
@@ -198,12 +218,15 @@ def apply_free_usage_cooldown(
     model: str | None = None,
     source: str = "probe",
 ) -> dict[str, Any] | None:
-    """Stack free-usage cooldown status onto this account in PostgreSQL.
+    """Apply free-usage cooldown onto this account in PostgreSQL.
 
+    Design goals (large free-tier pools):
     - Decision reference is the free-usage-exhausted payload.
-    - Cooldown calculation uses existing DB status (status_stack / cooldown_count).
-    - Each batch/probe failure stacks another status entry (not time).
-    - Single successful probe clears stack → normal.
+    - Cooldown is time-bounded (``cooldown_until``); once expired, account is
+      eligible again even before the next successful probe.
+    - Duplicate free-usage hits inside FREE_USAGE_RESTACK_MIN_SEC only refresh
+      the remaining TTL instead of stacking forever.
+    - Successful probe still clears stack → normal immediately.
     """
     if not account_id:
         return None
@@ -212,9 +235,52 @@ def apply_free_usage_cooldown(
         return None
     if model and not parsed.get("model"):
         parsed["model"] = model
-    state = get_account_pool_state()
-    meta = _pool_meta(account_id, state)
-    # Stack status entry from DB baseline (do not refresh/recompute away).
+    # Single-account meta only — probe/live hot path must not load whole pool.
+    meta = _pool_meta(account_id, {account_id: get_account_pool_meta(account_id)})
+    now = _now()
+
+    # Existing stack / count (durable).
+    prev_stack: list[dict[str, Any]] = []
+    raw_stack = meta.get("status_stack") if isinstance(meta, dict) else None
+    if isinstance(raw_stack, list):
+        for item in raw_stack:
+            if isinstance(item, dict):
+                prev_stack.append(dict(item))
+    try:
+        prev_count = int(meta.get("cooldown_count") or 0)
+    except (TypeError, ValueError):
+        prev_count = 0
+    if prev_stack:
+        prev_count = max(prev_count, len(prev_stack))
+
+    # Active free-usage window still running? Avoid thrashing the stack.
+    until_existing = None
+    try:
+        if meta.get("cooldown_until") is not None:
+            until_existing = float(meta.get("cooldown_until"))
+    except (TypeError, ValueError):
+        until_existing = None
+    still_active = bool(until_existing is not None and until_existing > now)
+    last_hit_at = 0.0
+    if prev_stack:
+        try:
+            last_hit_at = float(prev_stack[-1].get("at") or 0)
+        except (TypeError, ValueError):
+            last_hit_at = 0.0
+    if last_hit_at <= 0:
+        try:
+            last_hit_at = float(meta.get("last_probe_fail_at") or 0)
+        except (TypeError, ValueError):
+            last_hit_at = 0.0
+    recent_hit = (now - last_hit_at) < float(FREE_USAGE_RESTACK_MIN_SEC)
+
+    restack = True
+    if still_active and recent_hit:
+        # Same free-usage window already applied — only refresh remaining TTL.
+        restack = False
+    if prev_count >= int(FREE_USAGE_STACK_MAX) and still_active:
+        restack = False
+
     entry = {
         "kind": "free_usage_exhausted",
         "code": parsed.get("code"),
@@ -223,14 +289,25 @@ def apply_free_usage_cooldown(
         "tokens_limit": parsed.get("tokens_limit"),
         "source": source,
         "status_code": status_code,
-        "at": _now(),
+        "at": now,
         "reason": parsed.get("reason"),
     }
-    stack = stack_status_entry(meta, entry)
-    new_count = len(stack)
-    # Marker until only for legacy readers; recovery is status_stack clear.
-    until = _now() + max(3600.0, float(PROBE_KICK_COOLDOWN_SEC)) * max(1, new_count)
-    reason = str(parsed.get("reason") or "临时额度耗尽，已冷却，等待下次测活成功")[:300]
+    if restack:
+        stack = stack_status_entry(meta, entry)
+        # Cap stack growth so cooldown_count cannot run away on large pools.
+        if len(stack) > int(FREE_USAGE_STACK_MAX):
+            stack = stack[-int(FREE_USAGE_STACK_MAX) :]
+        new_count = min(int(FREE_USAGE_STACK_MAX), max(1, len(stack)))
+    else:
+        stack = prev_stack or [entry]
+        new_count = max(1, min(int(FREE_USAGE_STACK_MAX), prev_count or 1))
+
+    ttl = _free_usage_cooldown_ttl(new_count)
+    # If already cooling, never shorten remaining wait; only extend up to cap.
+    until = now + ttl
+    if still_active and until_existing is not None:
+        until = max(until_existing, min(now + float(FREE_USAGE_COOLDOWN_MAX_SEC), until))
+    reason = str(parsed.get("reason") or "临时额度耗尽，已冷却，等待自动恢复/测活成功")[:300]
     patch: dict[str, Any] = {
         "pool_status": "cooldown",
         "cooldown_count": new_count,
@@ -242,17 +319,20 @@ def apply_free_usage_cooldown(
         "cooldown_tokens_limit": parsed.get("tokens_limit"),
         "cooldown_detail": parsed.get("detail"),
         "cooldown_until": until,
-        "cooldown_sec": float(new_count),
+        # Keep wall-clock TTL (seconds remaining baseline) for UI / soft recovery.
+        "cooldown_sec": float(ttl),
         "last_error": reason,
         "last_status_code": status_code,
         "enabled": True,
         "disabled_reason": None,
         "disabled_source": None,
         "last_probe_status": "cooldown",
-        "last_probe_fail_at": _now(),
+        "last_probe_fail_at": now,
     }
-    # Soft-block the exhausted model on this account.
+    # Soft-block the exhausted model on this account for the same window.
     mid = parsed.get("model") or model
+    soft_ttl = min(float(ttl), float(SOFT_MODEL_BLOCK_TTL) * max(1, new_count))
+    soft_ttl = max(60.0, min(float(FREE_USAGE_COOLDOWN_MAX_SEC), soft_ttl))
     if mid:
         try:
             block_model(
@@ -260,7 +340,7 @@ def apply_free_usage_cooldown(
                 str(mid),
                 reason=reason,
                 source="temp_usage",
-                ttl_sec=float(PROBE_KICK_COOLDOWN_SEC),
+                ttl_sec=soft_ttl,
             )
         except Exception:
             pass
@@ -272,20 +352,22 @@ def apply_free_usage_cooldown(
     except Exception:
         pass
     invalidate_pool_summary_cache()
+    action = "cooldown" if restack else "cooldown_refresh"
     print(
-        f"  [pool] free-usage status stack ×{new_count} "
-        f"account={account_id} model={mid} code={parsed.get('code')}"
+        f"  [pool] free-usage {action} ×{new_count} "
+        f"ttl={int(ttl)}s account={account_id} model={mid} code={parsed.get('code')}"
     )
     return {
         "id": account_id,
-        "action": "cooldown",
+        "action": action,
         "pool_status": "cooldown",
         "cooldown_count": new_count,
-        "status_stack_len": new_count,
+        "status_stack_len": len(stack),
         "cooldown_code": parsed.get("code"),
         "cooldown_model": mid,
         "cooldown_reason": reason,
         "cooldown_until": until,
+        "cooldown_ttl_sec": ttl,
         "enabled": True,
         "meta": saved,
     }
@@ -640,27 +722,19 @@ def is_model_blocked(
 
 
 def is_in_cooldown(meta: dict[str, Any]) -> bool:
-    """True while this account has durable stacked cooldown status in DB.
+    """True while this account is still inside an active cooldown window.
 
-    Source of truth (no refresh/recompute from Redis):
-      1) status_stack length > 0
-      2) cooldown_count > 0
-      3) pool_status == cooldown
-      4) legacy cooldown_until still in future
-    Only successful 测活 / manual clear clears these fields.
+    Free-tier policy (operator rule):
+      - free-usage-exhausted → enter cooldown with cooldown_until
+      - model probe success → clear cooldown / re-enter pool
+      - wall-clock until is the only durable skip signal
+
+    Stack / count / pool_status alone must NOT keep an account ineligible after
+    the TTL expires (or when until is missing). Missing until is treated as
+    eligible so the next probe can re-evaluate free usage.
     """
     if not isinstance(meta, dict):
         return False
-    stack = meta.get("status_stack")
-    if isinstance(stack, list) and len(stack) > 0:
-        return True
-    try:
-        if int(meta.get("cooldown_count") or 0) > 0:
-            return True
-    except (TypeError, ValueError):
-        pass
-    if str(meta.get("pool_status") or "") == "cooldown":
-        return True
     until = meta.get("cooldown_until")
     if until is None:
         return False
@@ -668,6 +742,67 @@ def is_in_cooldown(meta: dict[str, Any]) -> bool:
         return _now() < float(until)
     except (TypeError, ValueError):
         return False
+
+
+def maybe_expire_cooldown(account_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """If cooldown_until elapsed, clear durable free-usage/cooldown markers.
+
+    Returns updated meta summary when a clear happened, else None.
+    Safe to call on hot paths (single-account patch only).
+    """
+    if not account_id:
+        return None
+    if meta is None:
+        meta = get_account_pool_meta(account_id) or {}
+    if not isinstance(meta, dict):
+        return None
+    until = meta.get("cooldown_until")
+    if until is None:
+        # No wall-clock marker — do not auto-clear status_stack here (manual/probe).
+        return None
+    try:
+        until_f = float(until)
+    except (TypeError, ValueError):
+        return None
+    if _now() < until_f:
+        return None
+    # Expired → re-enter pool as normal. Keep last_error for UI forensics.
+    try:
+        from store.pool_redis import clear_cooldown
+
+        clear_cooldown(account_id)
+    except Exception:
+        pass
+    saved = patch_account_pool_meta(
+        account_id,
+        {
+            "cooldown_count": 0,
+            "status_stack": [],
+            "cooldown_until": None,
+            "cooldown_sec": None,
+            "cooldown_reason": None,
+            "cooldown_code": None,
+            "cooldown_model": None,
+            "cooldown_tokens_actual": None,
+            "cooldown_tokens_limit": None,
+            "cooldown_detail": None,
+            "consecutive_fails": 0,
+            "pool_status": "normal",
+            "last_probe_status": "normal",
+        },
+    )
+    invalidate_pool_summary_cache()
+    out = dict(saved) if isinstance(saved, dict) else {}
+    out.update(
+        {
+            "id": account_id,
+            "in_cooldown": False,
+            "pool_status": "normal",
+            "cooldown_count": 0,
+            "expired_cooldown": True,
+        }
+    )
+    return out
 
 
 def stack_cooldown_count(
@@ -815,8 +950,31 @@ def _eligible(
     meta = _pool_meta(aid, state, redis_overlay=redis_overlay)
     if not meta["enabled"]:
         return False
+    # Active wall-clock cooldown still running → skip.
     if is_in_cooldown(meta):
         return False
+    # TTL elapsed (or no active until) but durable stack leftovers remain:
+    # lazily clear so pool_status/count stay accurate for admin UI.
+    try:
+        until = meta.get("cooldown_until")
+        leftover = (
+            int(meta.get("cooldown_count") or 0) > 0
+            or (
+                isinstance(meta.get("status_stack"), list)
+                and len(meta.get("status_stack") or []) > 0
+            )
+            or str(meta.get("pool_status") or "") == "cooldown"
+        )
+        if leftover and (
+            until is None
+            or (until is not None and _now() >= float(until))
+        ):
+            # Only auto-clear when until is present and elapsed. Bare stack
+            # without until stays until probe/manual (legacy safety).
+            if until is not None and _now() >= float(until):
+                maybe_expire_cooldown(aid, meta)
+    except Exception:
+        pass
     if model and is_model_blocked(aid, model, state, meta=meta):
         return False
     return True
@@ -1340,8 +1498,8 @@ def block_model(
     """
     if not account_id or not model:
         return None
-    state = get_account_pool_state()
-    meta = state.get(account_id) or {}
+    # Avoid full-pool reads on the probe hot path (many models × many accounts).
+    meta = get_account_pool_meta(account_id) or {}
     if not isinstance(meta, dict):
         meta = {}
     blocked = meta.get("blocked_models")
@@ -1371,7 +1529,7 @@ def block_model(
         entry["stacked_add_sec"] = float(ttl_sec)
     blocked[model] = entry
     last_error = f"[{model}] {blocked[model]['reason']}"
-    patch_account_pool_meta(
+    saved = patch_account_pool_meta(
         account_id,
         {"blocked_models": blocked, "last_error": last_error},
     )
@@ -1381,23 +1539,24 @@ def block_model(
             f"  [model] blocked{ttl_note} {model} for account "
             f"{account_id}: {blocked[model]['reason']}"
         )
-    for a in list_pool_accounts():
-        if a["id"] == account_id:
-            return a
-    return {
-        "id": account_id,
-        "blocked_models": blocked,
-        "model": model,
-        "reason": blocked[model]["reason"],
-    }
+    # Lightweight return — callers only need ids / blocked map, not full pool row.
+    out = dict(saved) if isinstance(saved, dict) else {}
+    out.update(
+        {
+            "id": account_id,
+            "blocked_models": blocked,
+            "model": model,
+            "reason": blocked[model]["reason"],
+        }
+    )
+    return out
 
 
 def unblock_model(account_id: str, model: str | None = None) -> dict[str, Any] | None:
     """Clear one model block, or all model blocks if model is None."""
     if not account_id:
         return None
-    state = get_account_pool_state()
-    meta = state.get(account_id) or {}
+    meta = get_account_pool_meta(account_id) or {}
     if not isinstance(meta, dict):
         return None
     blocked = meta.get("blocked_models")
@@ -1413,11 +1572,15 @@ def unblock_model(account_id: str, model: str | None = None) -> dict[str, Any] |
         patch["blocked_models"] = blocked if blocked else None
     else:
         return {"id": account_id, "blocked_models": blocked}
-    patch_account_pool_meta(account_id, patch)
-    for a in list_pool_accounts():
-        if a["id"] == account_id:
-            return a
-    return {"id": account_id, "blocked_models": blocked if model is not None else {}}
+    saved = patch_account_pool_meta(account_id, patch)
+    out = dict(saved) if isinstance(saved, dict) else {}
+    out.update(
+        {
+            "id": account_id,
+            "blocked_models": blocked if model is not None else {},
+        }
+    )
+    return out
 
 
 def disable_for_quota(
@@ -1427,14 +1590,13 @@ def disable_for_quota(
     source: str = "billing",
 ) -> dict[str, Any] | None:
     """Disable account permanently from rotation due to quota exhaustion."""
-    state = get_account_pool_state()
-    meta = state.get(account_id) or {}
+    meta = get_account_pool_meta(account_id) or {}
     if not isinstance(meta, dict):
         meta = {}
     already = meta.get("enabled") is False and meta.get("disabled_for_quota")
     reason_s = (reason or "额度已耗尽")[:300]
     now = _now()
-    patch_account_pool_meta(
+    saved = patch_account_pool_meta(
         account_id,
         {
             "enabled": False,
@@ -1461,15 +1623,16 @@ def disable_for_quota(
             f"  [quota] account disabled from pool: "
             f"{account_id} — {reason_s}"
         )
-    for a in list_pool_accounts():
-        if a["id"] == account_id:
-            return a
-    return {
-        "id": account_id,
-        "enabled": False,
-        "disabled_for_quota": True,
-        "disabled_reason": reason_s,
-    }
+    out = dict(saved) if isinstance(saved, dict) else {}
+    out.update(
+        {
+            "id": account_id,
+            "enabled": False,
+            "disabled_for_quota": True,
+            "disabled_reason": reason_s,
+        }
+    )
+    return out
 
 
 def save_quota_snapshot(account_id: str, quota_result: dict[str, Any]) -> None:
@@ -1507,7 +1670,7 @@ def save_quota_snapshot(account_id: str, quota_result: dict[str, Any]) -> None:
     # drop Nones for compact JSON
     snap = {k: v for k, v in snap.items() if v is not None}
     patch: dict[str, Any] = {"last_quota": snap}
-    # keep disable flags coherent when exhausted
+    # keep disable flags coherent when exhausted / recovered
     if snap.get("exhausted") or snap.get("auto_disabled"):
         patch.update({
             "disabled_for_quota": True,
@@ -1515,8 +1678,132 @@ def save_quota_snapshot(account_id: str, quota_result: dict[str, Any]) -> None:
             "disabled_reason": (snap.get("exhaust_reason") or snap.get("summary") or "额度已耗尽")[:300],
             "quota_disabled_at": snap.get("fetched_at") or _now(),
             "quota_source": "billing",
+            "pool_status": "quota_disabled",
         })
+    elif snap.get("ok") and not snap.get("exhausted"):
+        # Healthy billing snapshot: re-enter rotation if we previously hard-disabled
+        # this account for quota/billing reasons.
+        try:
+            cur = get_account_pool_meta(account_id) or {}
+        except Exception:
+            cur = {}
+        if not isinstance(cur, dict):
+            cur = {}
+        src = str(cur.get("quota_source") or cur.get("disabled_source") or "")
+        was_quota = bool(cur.get("disabled_for_quota")) or src in (
+            "billing",
+            "upstream_error",
+            "model_health",
+            "quota",
+        )
+        if was_quota or cur.get("enabled") is False and "额度" in str(cur.get("disabled_reason") or ""):
+            patch.update(
+                {
+                    "disabled_for_quota": False,
+                    "enabled": True,
+                    "disabled_reason": None,
+                    "disabled_source": None,
+                    "quota_disabled_at": None,
+                    "quota_source": None,
+                    "pool_status": "normal",
+                }
+            )
     patch_account_pool_meta(account_id, patch)
+    if patch.get("enabled") is True:
+        invalidate_pool_summary_cache()
+
+
+def reenable_for_quota(
+    account_id: str,
+    *,
+    reason: str = "额度已恢复",
+    source: str = "billing",
+) -> dict[str, Any] | None:
+    """Clear quota-disable flags and put account back into rotation."""
+    if not account_id:
+        return None
+    reason_s = (reason or "额度已恢复")[:300]
+    saved = patch_account_pool_meta(
+        account_id,
+        {
+            "enabled": True,
+            "disabled_for_quota": False,
+            "disabled_reason": None,
+            "disabled_source": None,
+            "quota_disabled_at": None,
+            "quota_source": None,
+            "pool_status": "normal",
+            "last_error": reason_s,
+        },
+    )
+    invalidate_pool_summary_cache()
+    out = dict(saved) if isinstance(saved, dict) else {}
+    out.update(
+        {
+            "id": account_id,
+            "enabled": True,
+            "disabled_for_quota": False,
+            "pool_status": "normal",
+            "reenabled": True,
+            "reason": reason_s,
+            "source": source,
+        }
+    )
+    return out
+
+
+def expire_due_cooldowns(*, limit: int = 200) -> dict[str, Any]:
+    """Batch-clear accounts whose cooldown_until has elapsed.
+
+    Used by model_health / token maintainer background ticks so pool_status
+    does not stay 'cooldown' after the free-usage window ends.
+    """
+    cleared = 0
+    scanned = 0
+    errors = 0
+    try:
+        from store.accounts_pg import enabled as pg_on
+        from store.pg import connection
+
+        if not pg_on():
+            return {"ok": True, "cleared": 0, "scanned": 0, "backend": "none"}
+        ids: list[str] = []
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT account_id
+                    FROM account_pool
+                    WHERE cooldown_until IS NOT NULL
+                      AND cooldown_until <= NOW()
+                      AND (
+                        pool_status = 'cooldown'
+                        OR COALESCE(cooldown_count, 0) > 0
+                      )
+                    ORDER BY cooldown_until ASC
+                    LIMIT %s
+                    """,
+                    (max(1, min(int(limit or 200), 1000)),),
+                )
+                ids = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+        scanned = len(ids)
+        for aid in ids:
+            try:
+                if maybe_expire_cooldown(aid) is not None:
+                    cleared += 1
+            except Exception:
+                errors += 1
+        if cleared:
+            invalidate_pool_summary_cache()
+        return {
+            "ok": True,
+            "cleared": cleared,
+            "scanned": scanned,
+            "errors": errors,
+            "backend": "postgres",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "cleared": cleared, "scanned": scanned, "error": str(e)[:200]}
 
 
 
@@ -2114,21 +2401,19 @@ def clear_account_cooldown(account_id: str) -> dict[str, Any] | None:
         },
     )
     invalidate_pool_summary_cache()
-    for a in list_pool_accounts():
-        if a["id"] == account_id:
-            a["in_cooldown"] = False
-            a["cooldown_remaining_sec"] = 0.0
-            a["cooldown_count"] = 0
-            a["pool_status"] = (meta or {}).get("pool_status") or "normal"
-            return a
-    return {
-        "id": account_id,
-        "in_cooldown": False,
-        "cooldown_remaining_sec": 0.0,
-        "cooldown_count": 0,
-        "pool_status": (meta or {}).get("pool_status") or "normal",
-        "consecutive_fails": 0,
-    }
+    # Lightweight return for probe recovery path — avoid full pool scan.
+    out = dict(meta) if isinstance(meta, dict) else {}
+    out.update(
+        {
+            "id": account_id,
+            "in_cooldown": False,
+            "cooldown_remaining_sec": 0.0,
+            "cooldown_count": 0,
+            "pool_status": out.get("pool_status") or "normal",
+            "consecutive_fails": 0,
+        }
+    )
+    return out
 
 
 def kick_from_pool(
@@ -2146,7 +2431,7 @@ def kick_from_pool(
         return None
     reason_s = (reason or "手动移出轮询")[:300]
     if cooldown_sec and float(cooldown_sec) > 0:
-        meta0 = _pool_meta(account_id, get_account_pool_state())
+        meta0 = _pool_meta(account_id, {account_id: get_account_pool_meta(account_id)})
         new_count = stack_cooldown_count(meta0, add=1)
         until = _now() + max(float(cooldown_sec), 60.0) * max(1, new_count)
         # Durable PG meta bound to this account_id: stack count, not replace time.
@@ -2180,16 +2465,7 @@ def kick_from_pool(
         except Exception:
             pass
         invalidate_pool_summary_cache()
-        for a in list_pool_accounts():
-            if a["id"] == account_id:
-                a["in_cooldown"] = True
-                a["cooldown_until"] = until
-                a["cooldown_remaining_sec"] = max(0.0, until - _now())
-                a["cooldown_sec"] = float(new_count)
-                a["cooldown_count"] = new_count
-                a["pool_status"] = "cooldown"
-                a["last_error"] = reason_s
-                return a
+        # Probe / error path must not scan the whole pool for a return payload.
         return {
             "id": account_id,
             "in_cooldown": True,
@@ -2210,10 +2486,7 @@ def kick_from_pool(
             "pool_status": "disabled",
         },
     )
-    for a in list_pool_accounts():
-        if a["id"] == account_id:
-            return a
-    return {"id": account_id, "enabled": False, "disabled_reason": reason_s}
+    return {"id": account_id, "enabled": False, "disabled_reason": reason_s, "pool_status": "disabled"}
 
 
 def record_model_probe_outcome(
@@ -2234,8 +2507,8 @@ def record_model_probe_outcome(
     """
     if not account_id:
         return None
-    state = get_account_pool_state()
-    meta = _pool_meta(account_id, state)
+    # Probe cycles touch hundreds of accounts — never reload the whole pool here.
+    meta = _pool_meta(account_id, {account_id: get_account_pool_meta(account_id)})
     pol = cooldown_defaults()
     kick_at = int(pol.get("probe_fail_kick_streak") or PROBE_FAIL_KICK_STREAK)
     disable_at = int(pol.get("probe_fail_disable_streak") or PROBE_FAIL_DISABLE_STREAK)

@@ -4,6 +4,7 @@ FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Shanghai \
     GROK2API_HOST=0.0.0.0 \
     GROK2API_PORT=3000 \
     GROK2API_OPEN_BROWSER=0 \
@@ -57,7 +58,10 @@ RUN apt-get update \
         libxshmfence1 \
         libxss1 \
         libxtst6 \
+        tzdata \
         xvfb \
+    && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo Asia/Shanghai > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt

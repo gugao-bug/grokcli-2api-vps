@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.fd8289a708.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.1031c5bb2f.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -328,9 +328,21 @@
         <option value="0">永久</option>
       </select>
     </div>
-    <div class="g2a-field"><label>代理</label><input id="reg-proxy" placeholder="可选 http://..." /></div>
-    <div class="g2a-field"><label>代理用户名</label><input id="reg-proxy-username" /></div>
-    <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" /></div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="reg-proxy" title="支持代理池：每行一个；也可用逗号/分号分隔。格式：http://host:port 或 host:port:user:pass 或 socks5://...">代理池</label>
+      <textarea id="reg-proxy" rows="3" placeholder="可选，每行一个代理&#10;http://host:port&#10;host:port:user:pass&#10;socks5://user:pass@host:port" spellcheck="false"></textarea>
+      <p class="g2a-muted" style="margin:4px 0 0" id="reg-proxy-hint">支持多行代理池；批量注册时按策略轮换。共享账号可填下方用户名/密码。</p>
+    </div>
+    <div class="g2a-field"><label>代理用户名</label><input id="reg-proxy-username" placeholder="可选，共享认证" /></div>
+    <div class="g2a-field"><label>代理密码</label><input id="reg-proxy-password" type="password" placeholder="可选，共享认证" /></div>
+    <div class="g2a-field">
+      <label for="reg-proxy-strategy" title="round_robin=按序轮换 · random=随机 · sticky=始终用第一个">代理策略</label>
+      <select id="reg-proxy-strategy">
+        <option value="round_robin" selected>轮询 (round_robin)</option>
+        <option value="random">随机 (random)</option>
+        <option value="sticky">固定首个 (sticky)</option>
+      </select>
+    </div>
   </div>
   <div id="reg-session-box" class="g2a-subcard hidden" style="margin-top:12px" hidden>
     <div class="g2a-kv"><span>状态</span><span id="reg-status" class="g2a-tag">idle</span></div>
@@ -432,6 +444,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.09602ed3aa.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.03235a7d29.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

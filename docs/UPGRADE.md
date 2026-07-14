@@ -4,7 +4,7 @@
 
 - **PostgreSQL**：账号凭证、API Key、设置、账号池状态（含冷却）
 - **Redis**：粘性会话、热计数、轮询游标、维护锁、管理会话
-- `data/*.json` **仅作迁移源 / 可选镜像**，不再作为运行时权威存储
+- `data/*.json` **仅作迁移源与管理台导入导出**，运行时不再写本地 JSON 镜像
 
 ---
 
@@ -80,14 +80,16 @@ curl -fsS http://127.0.0.1:3000/health
 |-----------------|--------|
 | `auth.json` → `accounts` | Redis 热计数 / 粘性（可空启动） |
 | `keys.json` → `api_keys` | 管理台登录会话（需重新登录） |
-| `settings.json` 标量 / 注册配置 / 管理员密码哈希 | `models_cache.json`（会重建） |
-| `settings.json` 内 `account_pool` | 审计日志历史（若旧版无表） |
+| `settings.json` 标量 / 注册配置 / 管理员密码哈希 | 审计日志历史（若旧版无表） |
+| `settings.json` 内 `account_pool` | — |
+| `models_cache.json` → `models` 表（一次性迁移，可 `--skip-models`） | 运行时不再使用 `models_cache.json` |
 
 ### 注意
 
 - **首次迁移不要多实例并发跑** migrator；迁移完成后再拉高 `GROK2API_WORKERS`
 - 使用 `--merge-pool` 可在 PG 已有数据时合并，避免误清空
 - `keys` 导入为 **整表替换**（`replace_all`）；若 PG 里已有 Key 且 JSON 不全，请先备份
+- 迁移完成后 hybrid 运行时 **不会** 再写回 `auth.json` / `keys.json` / `settings.json` / `affinity.json`；备份请用管理台导出或 `pg_dump`
 
 ---
 

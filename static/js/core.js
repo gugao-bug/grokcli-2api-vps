@@ -179,7 +179,7 @@ const PAGE_META = {
   accounts: { title: "账号 / 轮询", sub: "Grok 账号、设备码登录、额度与导入导出" },
   usage: { title: "用量", sub: "Token 消耗与请求使用情况（今日 / 近 N 天 / 累计）" },
   logs: { title: "任务日志", sub: "查询后台任务结果（协议注册、SSO 导入、测活、Token 续期等）" },
-  models: { title: "模型", sub: "上游模型缓存与探测结果" },
+  models: { title: "模型", sub: "上游模型目录（入库）与探测结果" },
   settings: { title: "系统设置", sub: "修改管理员密码、轮询策略与 sub2api / 维护参数" },
   guide: { title: "接入指南", sub: "OpenAI / Anthropic 客户端配置示例" },
 };
@@ -579,6 +579,16 @@ function rebindPageControls() {
   on("btn-change-password", "onclick", async () => {
     try { await changeAdminPassword(); } catch (e) { toast(e.message || "修改失败", false); }
   });
+  if ($("set-outbound-proxy")) {
+    on("set-outbound-proxy", "oninput", () => { try { updateOutboundProxyHint(); } catch (_) {} });
+  }
+  if ($("set-outbound-proxy-strategy")) {
+    on("set-outbound-proxy-strategy", "onchange", () => { try { updateOutboundProxyHint(); } catch (_) {} });
+  }
+  if ($("set-outbound-proxy-enabled")) {
+    on("set-outbound-proxy-enabled", "onchange", () => { try { updateOutboundProxyHint(); } catch (_) {} });
+  }
+  try { updateOutboundProxyHint(); } catch (_) {}
   on("btn-refresh-acc", "onclick", async () => {
     try {
       _statusFetchedAt = 0;
@@ -653,15 +663,9 @@ function rebindPageControls() {
       const config = readRegConfig();
       cacheRegConfigLocal(config);
       $("btn-start-reg").disabled = true;
+      // Drop previous finished/stopped run before starting a new one.
+      resetRegProgressForNewTask();
       const r = await api("/accounts/register-email", { method: "POST", body: JSON.stringify(buildRegBody(config)) });
-      regFinishedNotified = false;
-      regStopping = false;
-      regPollInFlight = false;
-      regLastLogText = "";
-      regLastStatusText = "";
-      regLastEmailText = "";
-      regProbedIds = new Set();
-      regProbeRunning = false;
       regBatchId = r.batch_id || null;
       regSessionId = r.id || r.session_id || (Array.isArray(r.session_ids) ? r.session_ids[0] : null);
       regSessionIds = Array.isArray(r.session_ids) ? r.session_ids.slice() : (regSessionId ? [regSessionId] : []);
@@ -714,9 +718,20 @@ function rebindPageControls() {
       const r = await api("/register-email/test-proxy", { method: "POST", body: JSON.stringify(buildProxyTestBody(readRegConfig())) });
       showPanel("reg-session-box");
       setRegEmailText("xAI 代理测试");
-      setRegStatusText(r.ok ? "代理可用" : "代理不可用");
+      const poolN = r.proxy_pool && r.proxy_pool.count != null ? Number(r.proxy_pool.count) : 0;
+      let status = r.ok ? "代理可用" : "代理不可用";
+      if (poolN > 1) {
+        if (Array.isArray(r.results)) {
+          status = r.ok
+            ? `代理池 ${r.ok_count || 0}/${r.tested || r.results.length} 可用`
+            : `代理池测试失败 (${r.ok_count || 0}/${r.tested || r.results.length})`;
+        } else {
+          status = r.ok ? `代理可用 (池 ${poolN})` : `代理不可用 (池 ${poolN})`;
+        }
+      }
+      setRegStatusText(status);
       setLogPanel("reg-log", JSON.stringify(r, null, 2), { forceShow: true });
-      toast(r.ok ? "代理测试通过" : "代理测试失败", !!r.ok);
+      toast(r.ok ? status : (status + (r.error ? ": " + r.error : "")), !!r.ok);
     } catch (e) { toast(e.message, false); }
     finally { if ($("btn-test-reg-proxy")) $("btn-test-reg-proxy").disabled = false; }
   });
@@ -1881,6 +1896,8 @@ async function loadModels() {
     // Always replace — never keep a stale single-model dashboard snapshot.
     dashCache.models = list.slice();
     if (r && r.default_model) dashCache.default_model = r.default_model;
+    if (r && r.storage) dashCache.models_storage = r.storage;
+    if (r && r.meta) dashCache.models_meta = r.meta;
   } catch (e) {
     console.warn("loadModels failed", e);
     try { toast((e && e.message) || "加载模型列表失败", false); } catch (_) {}
@@ -1899,8 +1916,8 @@ function renderModels() {
     const sub = head && head.querySelector(".g2a-card-head p");
     if (sub) {
       sub.textContent = models.length
-        ? `上游 + 本地模型缓存，共 ${models.length} 个。可同步并查看探测结果。`
-        : "上游模型缓存。可同步并查看探测结果。";
+        ? `已从上游同步到数据库，共 ${models.length} 个模型。可重新同步并查看探测结果。`
+        : "模型目录为空。请点「同步上游模型」拉取并写入数据库。";
     }
   } catch (_) {}
   tbody.innerHTML = models.map(m => `
@@ -1956,16 +1973,38 @@ function renderModelHealthInfo() {
       parts.push(`踢出 冷却${last.kick_cooldown || 0}/硬${last.kick_disabled || 0}`);
     }
     if (last.deferred != null) parts.push(`延后 ${last.deferred}`);
+    if (last.budget_hit) parts.push("周期预算截断");
+    const lastModels = last.models || last.models_configured;
+    if (Array.isArray(lastModels) && lastModels.length) {
+      parts.push(`本轮模型 ${lastModels.join(",")}`);
+    }
     lastTxt = parts.join(" · ");
   }
   let sweepTxt = "";
   if (sweep && (sweep.covered != null || sweep.generation)) {
     const live = sweep.live ?? sweep.sweep_live;
     const left = sweep.remaining ?? sweep.sweep_remaining;
-    sweepTxt = ` · 扫池 ${sweep.covered ?? 0}${live != null ? "/" + live : ""}${left != null ? " 剩余" + left : ""}`;
+    const mode = sweep.mode || mh.selection || "priority_sweep";
+    sweepTxt = ` · 扫池(${mode}) ${sweep.covered ?? 0}${live != null ? "/" + live : ""}${left != null ? " 剩余" + left : ""}`;
+    const pr = (sweep.priority && (sweep.priority.batch || sweep.priority.remaining)) || null;
+    if (pr) {
+      sweepTxt += ` · 优先 冷却${pr.cooldown_due || 0}/未测${pr.never_probed || 0}/失败${pr.fail_streak || 0}/正常${pr.healthy || 0}`;
+    }
+    if (sweep.re_admit) sweepTxt += ` · 复检${sweep.re_admit}`;
+    if (sweep.held_recoverable) sweepTxt += ` · 限流待恢复${sweep.held_recoverable}`;
   }
+  let etaTxt = "";
+  if (mh.full_pool_eta_sec != null && Number(mh.full_pool_eta_sec) > 0) {
+    const sec = Number(mh.full_pool_eta_sec);
+    if (sec < 3600) etaTxt = ` · 全池约 ${Math.ceil(sec / 60)} 分钟`;
+    else etaTxt = ` · 全池约 ${(sec / 3600).toFixed(1)} 小时`;
+  }
+  const modelsTxt = (mh.probe_models || []).join(", ") || "—";
+  const rotateTxt = (mh.probe_models || []).length > 1
+    ? `（后台每轮轮转 1 个，共 ${(mh.probe_models || []).length} 个）`
+    : "";
   el.textContent =
-    `模型探测：后台每 ${mh.interval_sec ?? "?"}s 检查 · 每批 ${mh.probe_batch ?? "?"} · 模型 ${(mh.probe_models || []).join(", ") || "—"} · ${lastTxt}${sweepTxt}`;
+    `模型探测：后台每 ${mh.interval_sec ?? "?"}s 检查 · 每批 ${mh.probe_batch ?? "?"} · 模型 ${modelsTxt}${rotateTxt} · ${lastTxt}${sweepTxt}${etaTxt}`;
 }
 
 async function runAccountProbe(accountId, model) {
@@ -2271,6 +2310,28 @@ function clearRegTrack() {
   try { sessionStorage.removeItem(REG_TRACK_KEY); } catch (_) {}
 }
 
+function resetRegProgressForNewTask() {
+  // Hard-reset UI/state before every new registration so the progress card and
+  // task-log view never concatenate the previous finished/stopped run.
+  try { clearInterval(regPollTimer); } catch (_) {}
+  regPollTimer = null;
+  regBatchId = null;
+  regSessionId = null;
+  regSessionIds = [];
+  regFinishedNotified = false;
+  regStopping = false;
+  regPollInFlight = false;
+  regLastLogText = "";
+  regLastStatusText = "";
+  regLastEmailText = "";
+  regProbedIds = new Set();
+  regProbeRunning = false;
+  clearRegTrack();
+  setLogPanel("reg-log", "", { forceShow: false });
+  setRegStatusText("starting");
+  setRegEmailText("—");
+}
+
 function saveRegTrack() {
   try {
     if (!regBatchId && !regSessionId && !(regSessionIds && regSessionIds.length)) {
@@ -2345,6 +2406,41 @@ function dismissRegProgressCard() {
   setRegEmailText("—");
 }
 
+function stopRegPolling() {
+  try { clearInterval(regPollTimer); } catch (_) {}
+  regPollTimer = null;
+}
+
+function isNotFoundError(err) {
+  if (!err) return false;
+  if (Number(err.status) === 404) return true;
+  const msg = String(err.message || err.detail || "");
+  return /not found|registration (batch|session) not found/i.test(msg);
+}
+
+function markTrackedRegistrationMissing(reason) {
+  // Stale browser track after worker restart / TTL expiry: stop hammering 404s.
+  stopRegPolling();
+  regFinishedNotified = true;
+  regStopping = false;
+  const lines = [
+    "[恢复] 后端已找不到该注册任务（可能已完成并过期，或服务重启后进度未镜像）",
+    regBatchId ? `batch_id: ${regBatchId}` : "",
+    regSessionId ? `session_id: ${regSessionId}` : "",
+    reason ? `detail: ${reason}` : "",
+    "已停止轮询。可点「关闭」收起进度卡片，或重新开始注册",
+  ].filter(Boolean);
+  setRegStatusText("not found");
+  setRegEmailText(regBatchId ? `batch ${regBatchId}` : (regSessionId || "—"));
+  setLogPanel("reg-log", lines.join("\n"), { forceShow: true });
+  showPanel("reg-session-box");
+  // Drop ids so refresh / soft-nav won't resurrect 404 polling.
+  regBatchId = null;
+  regSessionId = null;
+  regSessionIds = [];
+  clearRegTrack();
+}
+
 function startRegPolling({ immediate = true, intervalMs = 2000 } = {}) {
   try { clearInterval(regPollTimer); } catch (_) {}
   // While stopping, poll a bit slower to reduce UI thrash; never sub-second.
@@ -2371,19 +2467,48 @@ async function stopRegistration() {
     regFinishedNotified = false;
     setRegStatusText("stopping");
     let r = null;
+    let missing = false;
     if (regBatchId) {
-      r = await api("/accounts/register-email/batches/" + encodeURIComponent(regBatchId) + "/stop", {
-        method: "POST",
-        body: "{}",
-      });
+      try {
+        r = await api("/accounts/register-email/batches/" + encodeURIComponent(regBatchId) + "/stop", {
+          method: "POST",
+          body: "{}",
+        });
+      } catch (e) {
+        if (isNotFoundError(e)) {
+          missing = true;
+          // Fall back to stop-all so any still-running workers exit.
+          try {
+            r = await api("/accounts/register-email/stop", { method: "POST", body: "{}" });
+          } catch (_) {
+            r = { ok: true, message: "批次已不存在，已停止轮询" };
+          }
+        } else {
+          throw e;
+        }
+      }
     } else if (regSessionId) {
-      r = await api("/accounts/register-email/sessions/" + encodeURIComponent(regSessionId) + "/stop", {
-        method: "POST",
-        body: "{}",
-      });
+      try {
+        r = await api("/accounts/register-email/sessions/" + encodeURIComponent(regSessionId) + "/stop", {
+          method: "POST",
+          body: "{}",
+        });
+      } catch (e) {
+        if (isNotFoundError(e)) {
+          missing = true;
+          try {
+            r = await api("/accounts/register-email/stop", { method: "POST", body: "{}" });
+          } catch (_) {
+            r = { ok: true, message: "会话已不存在，已停止轮询" };
+          }
+        } else {
+          throw e;
+        }
+      }
     } else if (regSessionIds && regSessionIds.length) {
       // No batch id — stop each known session, then stop-all as a safety net.
       const results = [];
+      let anyOk = false;
       for (const sid of regSessionIds) {
         try {
           results.push(
@@ -2392,17 +2517,28 @@ async function stopRegistration() {
               body: "{}",
             })
           );
+          anyOk = true;
         } catch (e) {
+          if (isNotFoundError(e)) missing = true;
           results.push({ ok: false, id: sid, error: (e && e.message) || String(e) });
         }
       }
       try {
         r = await api("/accounts/register-email/stop", { method: "POST", body: "{}" });
       } catch (_) {
-        r = { ok: true, message: "已请求停止已知会话", results };
+        r = {
+          ok: true,
+          message: anyOk ? "已请求停止已知会话" : "会话已不存在，已停止轮询",
+          results,
+        };
       }
     } else {
       r = await api("/accounts/register-email/stop", { method: "POST", body: "{}" });
+    }
+    if (missing && !(r && r.ok === false)) {
+      markTrackedRegistrationMissing((r && r.message) || "stop target not found");
+      toast(r && r.message ? r.message : "注册任务已不存在", true);
+      return;
     }
     toast(r && r.message ? r.message : "已请求停止注册", !!(r && r.ok !== false));
     setRegStatusText("stopping");
@@ -2638,6 +2774,7 @@ function readRegConfig() {
     proxy: $("reg-proxy") ? $("reg-proxy").value.trim() : "",
     proxy_username: $("reg-proxy-username") ? $("reg-proxy-username").value.trim() : "",
     proxy_password: $("reg-proxy-password") ? $("reg-proxy-password").value.trim() : "",
+    proxy_strategy: $("reg-proxy-strategy") ? $("reg-proxy-strategy").value.trim() : "round_robin",
     count: $("reg-count") ? $("reg-count").value.trim() : "1",
     concurrency: $("reg-concurrency") ? $("reg-concurrency").value.trim() : "5",
     stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "300",
@@ -2780,6 +2917,12 @@ function applyRegConfig(cfg) {
   if ($("reg-proxy")) $("reg-proxy").value = cfg.proxy || "";
   if ($("reg-proxy-username")) $("reg-proxy-username").value = cfg.proxy_username || "";
   if ($("reg-proxy-password")) $("reg-proxy-password").value = cfg.proxy_password || "";
+  if ($("reg-proxy-strategy")) {
+    const strat = String(cfg.proxy_strategy || "round_robin").trim().toLowerCase();
+    $("reg-proxy-strategy").value =
+      strat === "random" ? "random" : strat === "sticky" ? "sticky" : "round_robin";
+  }
+  updateRegProxyHint(cfg);
   if ($("reg-count")) $("reg-count").value = cfg.count != null ? String(cfg.count) : "1";
   if ($("reg-concurrency")) $("reg-concurrency").value = cfg.concurrency != null ? String(cfg.concurrency) : "5";
   if ($("reg-stagger-ms")) $("reg-stagger-ms").value = cfg.stagger_ms != null ? String(cfg.stagger_ms) : "300";
@@ -2963,6 +3106,7 @@ function buildRegBody(config) {
   if (config.proxy) body.proxy = config.proxy;
   if (config.proxy_username) body.proxy_username = config.proxy_username;
   if (config.proxy_password) body.proxy_password = config.proxy_password;
+  if (config.proxy_strategy) body.proxy_strategy = config.proxy_strategy;
   const count = Number.parseInt(config.count || "1", 10);
   const concurrency = Number.parseInt(config.concurrency || "5", 10);
   const stagger = Number.parseInt(config.stagger_ms || "300", 10);
@@ -2993,7 +3137,44 @@ function buildProxyTestBody(config) {
   if (config.proxy) body.proxy = config.proxy;
   if (config.proxy_username) body.proxy_username = config.proxy_username;
   if (config.proxy_password) body.proxy_password = config.proxy_password;
+  if (config.proxy_strategy) body.proxy_strategy = config.proxy_strategy;
+  // Multi-proxy lists: smoke-test up to 5 entries so pool health is visible.
+  const lines = String(config.proxy || "")
+    .split(/\r?\n|;|,/)
+    .map((s) => s.trim())
+    .filter((s) => s && !s.startsWith("#"));
+  if (lines.length > 1) {
+    body.test_all = true;
+    body.max_test = Math.min(5, lines.length);
+  }
   return body;
+}
+
+function countProxyLines(text) {
+  return String(text || "")
+    .split(/\r?\n|;/)
+    .map((s) => s.trim())
+    .filter((s) => s && !s.startsWith("#"))
+    .length;
+}
+
+function updateRegProxyHint(cfg) {
+  const el = $("reg-proxy-hint");
+  if (!el) return;
+  const text = $("reg-proxy") ? $("reg-proxy").value : (cfg && cfg.proxy) || "";
+  const n = countProxyLines(text);
+  const strat = $("reg-proxy-strategy")
+    ? $("reg-proxy-strategy").value
+    : (cfg && cfg.proxy_strategy) || "round_robin";
+  const stratLabel =
+    strat === "random" ? "随机" : strat === "sticky" ? "固定首个" : "轮询";
+  if (n <= 0) {
+    el.textContent = "未配置代理（直连）。可粘贴多行代理池；批量注册时按策略轮换。";
+  } else if (n === 1) {
+    el.textContent = `已配置 1 个代理（策略：${stratLabel}）。支持多行池。`;
+  } else {
+    el.textContent = `代理池 ${n} 个 · 策略：${stratLabel}。批量注册时每个任务取一个代理。`;
+  }
 }
 const REG_TERMINAL_OK = new Set(["success", "completed", "imported"]);
 const REG_TERMINAL_BAD = new Set([
@@ -3111,11 +3292,13 @@ async function restoreTrackedRegistration({ toastIfEmpty = false } = {}) {
   try {
     let batch = null;
     let sessions = [];
+    let batchMissing = false;
     if (regBatchId) {
       try {
         batch = await api("/accounts/register-email/batches/" + encodeURIComponent(regBatchId));
-      } catch (_) {
+      } catch (e) {
         batch = null;
+        batchMissing = isNotFoundError(e);
       }
     }
     if (batch) {
@@ -3131,11 +3314,25 @@ async function restoreTrackedRegistration({ toastIfEmpty = false } = {}) {
     }
     if (!sessions.length) {
       const ids = regSessionIds.length ? regSessionIds : (regSessionId ? [regSessionId] : []);
+      let foundAny = false;
+      let missingAll = ids.length > 0;
       for (const id of ids.slice(0, 40)) {
         try {
           const s = await api("/accounts/register-email/sessions/" + encodeURIComponent(id));
-          if (s) sessions.push(s);
-        } catch (_) {}
+          if (s) {
+            sessions.push(s);
+            foundAny = true;
+            missingAll = false;
+          }
+        } catch (e) {
+          if (!isNotFoundError(e)) missingAll = false;
+        }
+      }
+      // Only treat as fully missing when every looked-up id 404'd.
+      if (!foundAny && missingAll && (batchMissing || !regBatchId)) {
+        markTrackedRegistrationMissing("tracked batch/session 404");
+        if (toastIfEmpty) toast("未找到进行中的注册任务", false);
+        return true;
       }
     }
     if (sessions.length || batch) {
@@ -3146,19 +3343,7 @@ async function restoreTrackedRegistration({ toastIfEmpty = false } = {}) {
       if (ok) return true;
     }
     // Track exists but backend no longer has it (TTL expired / finished ages ago).
-    // Keep a final "not found" card instead of silently vanishing.
-    setRegStatusText("not found");
-    setLogPanel(
-      "reg-log",
-      [
-        "[恢复] 后端已找不到该注册任务（可能已完成并过期，或 worker 重启后未镜像）",
-        regBatchId ? `batch_id: ${regBatchId}` : "",
-        regSessionId ? `session_id: ${regSessionId}` : "",
-        "可点「关闭」收起进度卡片，或重新开始注册",
-      ].filter(Boolean).join("\n"),
-      { forceShow: true }
-    );
-    saveRegTrack();
+    markTrackedRegistrationMissing(batchMissing ? "batch not found" : "session not found");
     if (toastIfEmpty) toast("未找到进行中的注册任务", false);
     return true;
   } catch (e) {
@@ -3173,13 +3358,8 @@ async function restoreActiveRegistration({ force = false, toastIfEmpty = false }
     // Rehydrate from sessionStorage first (hard refresh path).
     applyRegTrack(loadRegTrack());
   }
-  if (!force && hasTrackedRegTask()) {
-    showPanel("reg-session-box");
-    if (!regFinishedNotified) startRegPolling({ immediate: true, intervalMs: 2000 });
-    else pollRegSession().catch(() => {});
-    saveRegTrack();
-    return true;
-  }
+  // Always re-validate tracked ids against backend. Blindly resuming poll from a
+  // stale sessionStorage track is what spammed console 404s after restarts.
   try {
     // 1) Prefer explicitly tracked ids (survives refresh even when list is empty).
     if (hasTrackedRegTask() || loadRegTrack()) {
@@ -3556,6 +3736,7 @@ async function pollRegSession() {
   try {
   // Prefer batch endpoint when available for accurate total/success/fail.
   let batch = null;
+  let batchMissing = false;
   if (regBatchId) {
     try {
       batch = await api("/accounts/register-email/batches/" + encodeURIComponent(regBatchId));
@@ -3564,55 +3745,94 @@ async function pollRegSession() {
           if (id && !regSessionIds.includes(id)) regSessionIds.push(id);
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      batchMissing = isNotFoundError(e);
+    }
   }
 
   const ids = regSessionIds.length ? regSessionIds : (regSessionId ? [regSessionId] : []);
-  if (!ids.length && !batch) return;
+  if (!ids.length && !batch) {
+    if (batchMissing || regBatchId) {
+      markTrackedRegistrationMissing(batchMissing ? "batch not found while polling" : "no sessions");
+    }
+    return;
+  }
 
   try {
     let sessions = [];
+    let sessionHits = 0;
+    let sessionMisses = 0;
     if (batch && Array.isArray(batch.sessions) && batch.sessions.length) {
       sessions = batch.sessions.slice();
+      sessionHits = sessions.length;
     } else {
       for (const id of ids) {
         try {
           sessions.push(await api("/accounts/register-email/sessions/" + encodeURIComponent(id)));
-        } catch (_) {}
+          sessionHits += 1;
+        } catch (e) {
+          if (isNotFoundError(e)) sessionMisses += 1;
+        }
       }
     }
 
     // Pull all sessions so late-spawned batch workers appear.
+    // Strict filter: only the currently tracked batch / session ids — never
+    // absorb leftover sessions from a previous finished/stopped registration.
+    let listHasTrackedBatch = false;
     try {
       const all = await api("/accounts/register-email/sessions");
       if (all && Array.isArray(all.sessions)) {
+        const trackedIds = new Set(
+          (regSessionIds && regSessionIds.length
+            ? regSessionIds
+            : (regSessionId ? [regSessionId] : [])
+          ).map((x) => String(x || "").trim()).filter(Boolean)
+        );
         const known = new Set(sessions.map(regSessionKey).filter(Boolean));
         for (const s of all.sessions) {
           const id = regSessionKey(s);
           if (!id) continue;
-          const sameBatch =
-            (regBatchId && s.batch_id === regBatchId) ||
-            (sessions.some((x) => x.batch_id && x.batch_id === s.batch_id));
-          if (regSessionIds.includes(id) || sameBatch) {
-            if (!regSessionIds.includes(id)) regSessionIds.push(id);
-            if (!known.has(id)) {
-              sessions.push(s);
-              known.add(id);
-            } else {
-              // refresh existing
-              const idx = sessions.findIndex((x) => regSessionKey(x) === id);
-              if (idx >= 0) sessions[idx] = s;
-            }
+          const sameBatch = !!(regBatchId && s.batch_id && s.batch_id === regBatchId);
+          const tracked = trackedIds.has(id);
+          // Without a batch id, only accept explicitly tracked session ids.
+          if (!(sameBatch || tracked)) continue;
+          if (!regSessionIds.includes(id)) regSessionIds.push(id);
+          if (!known.has(id)) {
+            sessions.push(s);
+            known.add(id);
+            sessionHits += 1;
+          } else {
+            // refresh existing
+            const idx = sessions.findIndex((x) => regSessionKey(x) === id);
+            if (idx >= 0) sessions[idx] = s;
           }
         }
         // Prefer batch stats from list endpoint when present.
-        if (!batch && regBatchId && Array.isArray(all.batches)) {
-          batch = all.batches.find((b) => (b.id || b.batch_id) === regBatchId) || batch;
+        if (regBatchId && Array.isArray(all.batches)) {
+          const listed = all.batches.find((b) => (b.id || b.batch_id) === regBatchId) || null;
+          if (listed) {
+            listHasTrackedBatch = true;
+            if (!batch) batch = listed;
+          }
         }
       }
     } catch (_) {}
 
-    if (!sessions.length && !batch) return;
+    if (!sessions.length && !batch) {
+      // All known ids 404'd and list has no matching batch → drop stale track.
+      if (
+        batchMissing ||
+        (ids.length > 0 && sessionMisses >= ids.length && sessionHits === 0 && !listHasTrackedBatch)
+      ) {
+        markTrackedRegistrationMissing(
+          batchMissing
+            ? "batch not found while polling"
+            : `sessions not found (${sessionMisses}/${ids.length})`
+        );
+      }
+      return;
+    }
 
     // Merge batch-level counters into status when session list still spawning.
     if (batch && (!sessions.length || (batch.count && sessions.length < batch.count))) {
@@ -4890,6 +5110,20 @@ function fillSystemSettingsForm(s) {
   if ($("set-probe-disable-streak") && pol.probe_fail_disable_streak != null) $("set-probe-disable-streak").value = pol.probe_fail_disable_streak;
   if ($("set-probe-kick-cd") && pol.probe_kick_cooldown_sec != null) $("set-probe-kick-cd").value = pol.probe_kick_cooldown_sec;
   if ($("set-max-failover") && pol.max_failover_attempts != null) $("set-max-failover").value = pol.max_failover_attempts;
+  // Outbound proxy pool (account chat / probe / refresh)
+  const ob = s.outbound_proxy_config || s.outbound_proxy || {};
+  if ($("set-outbound-proxy-enabled")) {
+    $("set-outbound-proxy-enabled").checked = ob.enabled !== false;
+  }
+  if ($("set-outbound-proxy")) $("set-outbound-proxy").value = ob.proxy || "";
+  if ($("set-outbound-proxy-username")) $("set-outbound-proxy-username").value = ob.proxy_username || "";
+  if ($("set-outbound-proxy-password")) $("set-outbound-proxy-password").value = ob.proxy_password || "";
+  if ($("set-outbound-proxy-strategy")) {
+    const st = String(ob.proxy_strategy || "round_robin").toLowerCase();
+    $("set-outbound-proxy-strategy").value =
+      st === "random" ? "random" : st === "sticky" ? "sticky" : "round_robin";
+  }
+  try { updateOutboundProxyHint(s); } catch (_) {}
   const pill = $("pwd-env-pill");
   if (pill) {
     if (s.admin_password_in_store || (s.has_admin_password && !s.admin_password_from_env)) {
@@ -4958,7 +5192,65 @@ function collectSystemSettingsPatch() {
   if ($("set-probe-disable-streak") && $("set-probe-disable-streak").value !== "") patch.probe_fail_disable_streak = Number($("set-probe-disable-streak").value);
   if ($("set-probe-kick-cd") && $("set-probe-kick-cd").value !== "") patch.probe_kick_cooldown_sec = Number($("set-probe-kick-cd").value);
   if ($("set-max-failover") && $("set-max-failover").value !== "") patch.max_failover_attempts = Number($("set-max-failover").value);
+  // Outbound proxy pool
+  if ($("set-outbound-proxy-enabled")) patch.outbound_proxy_enabled = !!$("set-outbound-proxy-enabled").checked;
+  if ($("set-outbound-proxy")) patch.outbound_proxy = $("set-outbound-proxy").value || "";
+  if ($("set-outbound-proxy-username")) patch.outbound_proxy_username = $("set-outbound-proxy-username").value || "";
+  if ($("set-outbound-proxy-password")) {
+    const pw = $("set-outbound-proxy-password").value || "";
+    // Empty keeps previous secret server-side unless user cleared proxy list.
+    if (pw) patch.outbound_proxy_password = pw;
+  }
+  if ($("set-outbound-proxy-strategy")) patch.outbound_proxy_strategy = $("set-outbound-proxy-strategy").value || "round_robin";
   return patch;
+}
+
+function countOutboundProxyLines(text) {
+  return String(text || "")
+    .split(/\r?\n|;/)
+    .map((s) => s.trim())
+    .filter((s) => s && !s.startsWith("#"))
+    .length;
+}
+
+function updateOutboundProxyHint(s) {
+  const hint = $("set-outbound-proxy-hint");
+  const pill = $("outbound-proxy-pill");
+  const enabled = $("set-outbound-proxy-enabled")
+    ? !!$("set-outbound-proxy-enabled").checked
+    : true;
+  const text = $("set-outbound-proxy")
+    ? $("set-outbound-proxy").value
+    : ((s && s.outbound_proxy_config && s.outbound_proxy_config.proxy) || "");
+  const n = countOutboundProxyLines(text);
+  const strat = $("set-outbound-proxy-strategy")
+    ? $("set-outbound-proxy-strategy").value
+    : ((s && s.outbound_proxy_config && s.outbound_proxy_config.proxy_strategy) || "round_robin");
+  const stratLabel =
+    strat === "random" ? "随机" : strat === "sticky" ? "固定首个" : "粘性哈希";
+  const summary = (s && s.outbound_proxy_pool) || {};
+  const src = summary.source || (n > 0 ? "settings" : "none");
+  if (hint) {
+    if (!enabled) {
+      hint.textContent = "已关闭出站代理，账号请求直连上游。";
+    } else if (n <= 0) {
+      hint.textContent = "未配置代理（直连）。可粘贴多行代理池；账号聊天/测活/续期共用。";
+    } else {
+      hint.textContent = `代理池 ${n} 个 · 策略：${stratLabel}。同一账号固定出口（会话粘性更稳）。来源：${src}`;
+    }
+  }
+  if (pill) {
+    if (!enabled) {
+      pill.textContent = "已关闭";
+      pill.className = "g2a-tag";
+    } else if (n <= 0) {
+      pill.textContent = "直连";
+      pill.className = "g2a-tag";
+    } else {
+      pill.textContent = `代理池 ${n}`;
+      pill.className = "g2a-tag g2a-tag-ok";
+    }
+  }
 }
 
 async function saveSystemSettings() {
@@ -5117,18 +5409,12 @@ if ($("btn-start-reg")) {
         const config = readRegConfig();
         cacheRegConfigLocal(config);
         if ($("btn-start-reg")) $("btn-start-reg").disabled = true;
+        // New task must not inherit previous run's log / track / poll state.
+        resetRegProgressForNewTask();
         const r = await api("/accounts/register-email", {
           method: "POST",
           body: JSON.stringify(buildRegBody(config)),
         });
-        regFinishedNotified = false;
-        regStopping = false;
-        regPollInFlight = false;
-        regLastLogText = "";
-        regLastStatusText = "";
-        regLastEmailText = "";
-        regProbedIds = new Set();
-        regProbeRunning = false;
         regBatchId = r.batch_id || null;
         if (r.batch || (Array.isArray(r.session_ids) && r.session_ids.length > 1) || (Array.isArray(r.sessions) && r.sessions.length > 1)) {
           regSessionIds = Array.isArray(r.session_ids) && r.session_ids.length
@@ -5150,6 +5436,8 @@ if ($("btn-start-reg")) {
         if (r.batch_id) {
           setTimeout(async () => {
             try {
+              // Ignore late batch snapshot if user already started another task.
+              if (regBatchId && regBatchId !== r.batch_id) return;
               const b = await api("/accounts/register-email/batches/" + encodeURIComponent(r.batch_id));
               if (Array.isArray(b.session_ids) && b.session_ids.length) {
                 regSessionIds = b.session_ids.slice();
@@ -5180,9 +5468,20 @@ if ($("btn-test-reg-proxy") && !$("btn-test-reg-proxy").onclick) {
       });
       showPanel("reg-session-box");
       setRegEmailText("xAI 代理测试");
-      setRegStatusText(r.ok ? "代理可用" : "代理不可用");
+      const poolN = r.proxy_pool && r.proxy_pool.count != null ? Number(r.proxy_pool.count) : 0;
+      let status = r.ok ? "代理可用" : "代理不可用";
+      if (poolN > 1) {
+        if (Array.isArray(r.results)) {
+          status = r.ok
+            ? `代理池 ${r.ok_count || 0}/${r.tested || r.results.length} 可用`
+            : `代理池测试失败 (${r.ok_count || 0}/${r.tested || r.results.length})`;
+        } else {
+          status = r.ok ? `代理可用 (池 ${poolN})` : `代理不可用 (池 ${poolN})`;
+        }
+      }
+      setRegStatusText(status);
       setLogPanel("reg-log", JSON.stringify(r, null, 2), { forceShow: true });
-      toast(r.ok ? "代理测试通过" : "代理测试失败", !!r.ok);
+      toast(r.ok ? status : (status + (r.error ? ": " + r.error : "")), !!r.ok);
     } catch (e) {
       toast(e.message, false);
     } finally {
@@ -5227,6 +5526,13 @@ if ($("reg-mail-provider")) {
   });
   syncRegMailProviderUI();
 }
+if ($("reg-proxy")) {
+  on("reg-proxy", "oninput", () => { try { updateRegProxyHint(); } catch (_) {} });
+}
+if ($("reg-proxy-strategy")) {
+  on("reg-proxy-strategy", "onchange", () => { try { updateRegProxyHint(); } catch (_) {} });
+}
+try { updateRegProxyHint(); } catch (_) {}
 
   window.addEventListener("pagehide", () => {
     try { if (devicePollTimer) clearInterval(devicePollTimer); } catch(_){}
@@ -5352,10 +5658,15 @@ async function loadUsageEvents({ reset = false } = {}) {
       const protoPath = `${it.protocol || "—"}${it.stream ? " · stream" : ""}\n${it.path || ""}`;
       const cacheRead = Number(it.cache_read_tokens || 0);
       const cacheCreate = Number(it.cache_creation_tokens || 0);
+      const promptTok = Number(it.prompt_tokens || 0);
       const cacheTokens = cacheRead + cacheCreate;
+      const hitPct = promptTok > 0 && cacheRead > 0
+        ? Math.min(100, Math.round((cacheRead / promptTok) * 1000) / 10)
+        : null;
       const cacheParts = [];
       if (cacheRead > 0) cacheParts.push(`读 ${fmtNum(cacheRead)}`);
       if (cacheCreate > 0) cacheParts.push(`写 ${fmtNum(cacheCreate)}`);
+      if (hitPct != null) cacheParts.push(`命中 ${hitPct}%`);
       const cacheSub = cacheParts.join(" / ");
       const reasoningTokens = Number(it.reasoning_tokens || 0);
       const okPill = it.ok
@@ -5487,6 +5798,11 @@ async function loadUsage() {
     const today = (sum && sum.today) || {};
     const window = (sum && sum.window) || {};
     const life = (sum && sum.lifetime) || {};
+    const cache = (sum && sum.cache) || {};
+    const cacheToday = cache.today || {};
+    const cacheWin = cache.window || {};
+    const cacheLife = cache.lifetime || {};
+    const fmtRatio = (v) => (v == null || v === "" ? "—" : `${v}%`);
     const grid = $("usage-stats-grid");
     if (grid) {
       grid.innerHTML = `
@@ -5494,15 +5810,21 @@ async function loadUsage() {
           <div class="sub">成功 ${fmtNum(today.success)} · 失败 ${fmtNum(today.fail)}${today.success_rate != null ? ` · ${today.success_rate}%` : ""}</div></div>
         <div class="stat"><div class="label">今日 token</div><div class="value mono">${fmtNum(today.total_tokens)}</div>
           <div class="sub">输入 ${fmtNum(today.prompt_tokens)} · 输出 ${fmtNum(today.completion_tokens)}</div></div>
+        <div class="stat"><div class="label">今日缓存命中</div><div class="value mono">${fmtRatio(cacheToday.token_hit_ratio)}</div>
+          <div class="sub">读 ${fmtNum(cacheToday.cache_read_tokens || 0)} / 输入 ${fmtNum(cacheToday.prompt_tokens || 0)} · 请求命中 ${fmtRatio(cacheToday.request_hit_ratio)}</div></div>
         <div class="stat"><div class="label">近 ${usageDays} 天 token</div><div class="value mono">${fmtNum(window.total_tokens)}</div>
           <div class="sub">请求 ${fmtNum(window.requests)}${window.success_rate != null ? ` · 成功率 ${window.success_rate}%` : ""}</div></div>
+        <div class="stat"><div class="label">近 ${usageDays} 天缓存命中</div><div class="value mono">${fmtRatio(cacheWin.token_hit_ratio)}</div>
+          <div class="sub">读 ${fmtNum(cacheWin.cache_read_tokens || 0)} / 输入 ${fmtNum(cacheWin.prompt_tokens || 0)} · 请求命中 ${fmtRatio(cacheWin.request_hit_ratio)}</div></div>
         <div class="stat"><div class="label">累计 token</div><div class="value mono">${fmtNum(life.total_tokens)}</div>
-          <div class="sub">请求 ${fmtNum(life.requests)} · 源 ${esc((sum && sum.source) || "—")}</div></div>
+          <div class="sub">请求 ${fmtNum(life.requests)} · 累计缓存读 ${fmtNum(cacheLife.cache_read_tokens || 0)} · 源 ${esc((sum && sum.source) || "—")}</div></div>
       `;
     }
     if ($("usage-source")) {
       $("usage-source").textContent = "数据源: " + ((sum && sum.source) || "none") +
-        " · UTC 日切 · 失败请求不计 token";
+        " · 缓存命中来自 usage_events（token 命中率 = cache_read / prompt）" +
+        " · UTC 日切 · 失败请求不计 token" +
+        (cache.source ? ` · cache源 ${cache.source}` : "");
     }
     renderUsageBars((sum && sum.series) || []);
     renderUsageTable("usage-by-key-tbody", (byKey && byKey.items) || [], "key");

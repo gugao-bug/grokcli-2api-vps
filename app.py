@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.49"
+APP_VERSION = "1.9.67"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -62,63 +62,165 @@ _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 
 # Shared upstream HTTP client (per process / worker) — reuse TLS + keepalive.
+# Default direct client + per-proxy clients so account-pool egress can rotate
+# without reopening a TCP connection on every request.
 _http_client: httpx.AsyncClient | None = None
+_http_clients_by_proxy: dict[str, httpx.AsyncClient] = {}
 _http_client_lock = asyncio.Lock() if hasattr(asyncio, "Lock") else None  # set later
 
 
-async def get_http_client() -> httpx.AsyncClient:
-    """Process-wide AsyncClient with connection pooling for high concurrency."""
+def _http_timeouts() -> tuple[httpx.Timeout, httpx.Limits]:
+    max_conn = int(os.getenv("GROK2API_HTTP_MAX_CONNECTIONS", "200") or 200)
+    max_keep = int(os.getenv("GROK2API_HTTP_MAX_KEEPALIVE", "50") or 50)
+    # Keep connect timeout tight for TTFT.
+    connect_timeout = float(os.getenv("GROK2API_HTTP_CONNECT_TIMEOUT", "5") or 5)
+    connect_timeout = max(1.0, min(30.0, connect_timeout))
+    # Stream-friendly timeouts:
+    # - read: idle gap between SSE lines (thinking / tool prep). Must be
+    #   longer than typical silence but short enough to detect dead sockets.
+    # - write/pool: leave generous; long tool loops can stall writes.
+    read_timeout = float(os.getenv("GROK2API_HTTP_READ_TIMEOUT", "180") or 180)
+    read_timeout = max(30.0, min(float(TIMEOUT), read_timeout))
+    write_timeout = float(os.getenv("GROK2API_HTTP_WRITE_TIMEOUT", "60") or 60)
+    write_timeout = max(10.0, min(300.0, write_timeout))
+    pool_timeout = float(os.getenv("GROK2API_HTTP_POOL_TIMEOUT", "30") or 30)
+    pool_timeout = max(5.0, min(120.0, pool_timeout))
+    # Overall timeout covers multi-minute streams (tool loops).
+    overall = max(float(TIMEOUT), read_timeout + 60.0)
+    timeout = httpx.Timeout(
+        timeout=overall,
+        connect=connect_timeout,
+        read=read_timeout,
+        write=write_timeout,
+        pool=pool_timeout,
+    )
+    limits = httpx.Limits(
+        max_keepalive_connections=max_keep,
+        max_connections=max_conn,
+        keepalive_expiry=90.0,
+    )
+    return timeout, limits
+
+
+def _new_async_client(*, proxy: str | None = None) -> httpx.AsyncClient:
+    timeout, limits = _http_timeouts()
+    kwargs: dict[str, Any] = {
+        "timeout": timeout,
+        "limits": limits,
+        "http2": False,
+    }
+    proxy_url = (proxy or "").strip()
+    if proxy_url:
+        # httpx>=0.28 uses `proxy=`; older used `proxies=`. Try modern first.
+        try:
+            return httpx.AsyncClient(proxy=proxy_url, **kwargs)
+        except TypeError:
+            return httpx.AsyncClient(
+                proxies={"http://": proxy_url, "https://": proxy_url},
+                **kwargs,
+            )
+    return httpx.AsyncClient(**kwargs)
+
+
+async def get_http_client(
+    account_id: str | None = None,
+    *,
+    proxy: str | None = None,
+) -> httpx.AsyncClient:
+    """Shared AsyncClient; optionally bound to a proxy for account-pool egress.
+
+    When a proxy pool is configured, ``account_id`` selects a sticky proxy so
+    multi-turn affinity keeps the same egress IP. Direct (no-proxy) client is
+    process-wide; each distinct proxy URL gets its own pooled client.
+    """
     global _http_client
-    if _http_client is not None and not _http_client.is_closed:
+    proxy_url = (proxy or "").strip() or None
+    if proxy_url is None and account_id:
+        try:
+            from proxy_pool import pick_proxy_for_account
+
+            proxy_url = pick_proxy_for_account(account_id)
+        except Exception:
+            proxy_url = None
+
+    if not proxy_url:
+        if _http_client is not None and not _http_client.is_closed:
+            return _http_client
+        # Double-checked init (asyncio single-threaded: assignment is enough)
+        if _http_client is None or _http_client.is_closed:
+            _http_client = _new_async_client()
         return _http_client
-    # Double-checked init (asyncio single-threaded: assignment is enough)
-    if _http_client is None or _http_client.is_closed:
-        max_conn = int(os.getenv("GROK2API_HTTP_MAX_CONNECTIONS", "200") or 200)
-        max_keep = int(os.getenv("GROK2API_HTTP_MAX_KEEPALIVE", "50") or 50)
-        # Keep connect timeout tight for TTFT.
-        connect_timeout = float(os.getenv("GROK2API_HTTP_CONNECT_TIMEOUT", "5") or 5)
-        connect_timeout = max(1.0, min(30.0, connect_timeout))
-        # Stream-friendly timeouts:
-        # - read: idle gap between SSE lines (thinking / tool prep). Must be
-        #   longer than typical silence but short enough to detect dead sockets.
-        # - write/pool: leave generous; long tool loops can stall writes.
-        read_timeout = float(
-            os.getenv("GROK2API_HTTP_READ_TIMEOUT", "180") or 180
-        )
-        read_timeout = max(30.0, min(float(TIMEOUT), read_timeout))
-        write_timeout = float(
-            os.getenv("GROK2API_HTTP_WRITE_TIMEOUT", "60") or 60
-        )
-        write_timeout = max(10.0, min(300.0, write_timeout))
-        pool_timeout = float(
-            os.getenv("GROK2API_HTTP_POOL_TIMEOUT", "30") or 30
-        )
-        pool_timeout = max(5.0, min(120.0, pool_timeout))
-        # Overall timeout covers multi-minute streams (tool loops).
-        overall = max(float(TIMEOUT), read_timeout + 60.0)
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                timeout=overall,
-                connect=connect_timeout,
-                read=read_timeout,
-                write=write_timeout,
-                pool=pool_timeout,
-            ),
-            limits=httpx.Limits(
-                max_keepalive_connections=max_keep,
-                max_connections=max_conn,
-                keepalive_expiry=90.0,
-            ),
-            http2=False,
-        )
-    return _http_client
+
+    client = _http_clients_by_proxy.get(proxy_url)
+    if client is not None and not client.is_closed:
+        return client
+    client = _new_async_client(proxy=proxy_url)
+    _http_clients_by_proxy[proxy_url] = client
+    # Bound the map so a huge residential pool cannot retain thousands of clients.
+    if len(_http_clients_by_proxy) > 32:
+        # Drop an arbitrary idle-ish entry (not the one we just created).
+        for old_key in list(_http_clients_by_proxy.keys()):
+            if old_key == proxy_url:
+                continue
+            old = _http_clients_by_proxy.pop(old_key, None)
+            if old is not None and not old.is_closed:
+                try:
+                    await old.aclose()
+                except Exception:
+                    pass
+            break
+    return client
+
+
+def invalidate_http_clients() -> None:
+    """Mark cached clients for rebuild (proxy config changed).
+
+    Actual close is best-effort / async-safe: schedule aclose when a loop is
+    running, otherwise close via anyio/asyncio.run fallback.
+    """
+    global _http_client
+    clients: list[httpx.AsyncClient] = []
+    if _http_client is not None:
+        clients.append(_http_client)
+        _http_client = None
+    clients.extend(list(_http_clients_by_proxy.values()))
+    _http_clients_by_proxy.clear()
+
+    async def _close_all() -> None:
+        for c in clients:
+            if c is not None and not c.is_closed:
+                try:
+                    await c.aclose()
+                except Exception:
+                    pass
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        loop.create_task(_close_all())
+        return
+    try:
+        asyncio.run(_close_all())
+    except Exception:
+        pass
 
 
 async def _close_http_client() -> None:
     global _http_client
-    if _http_client is not None and not _http_client.is_closed:
-        await _http_client.aclose()
-    _http_client = None
+    clients: list[httpx.AsyncClient] = []
+    if _http_client is not None:
+        clients.append(_http_client)
+        _http_client = None
+    clients.extend(list(_http_clients_by_proxy.values()))
+    _http_clients_by_proxy.clear()
+    for c in clients:
+        if c is not None and not c.is_closed:
+            try:
+                await c.aclose()
+            except Exception:
+                pass
 
 
 def _on_startup() -> None:
@@ -163,6 +265,26 @@ def _on_startup() -> None:
         )
     except Exception as e:  # noqa: BLE001
         print(f"  store: status unavailable ({e})")
+
+    # Seed model catalog into PostgreSQL when empty so multi-worker /v1/models
+    # reads a shared durable source of truth (no models_cache.json).
+    try:
+        from models import ensure_models_catalog_seeded
+
+        seed = ensure_models_catalog_seeded()
+        if seed.get("ok"):
+            print(
+                "  models catalog: "
+                + (
+                    f"seeded baseline into postgres (count={seed.get('count')})"
+                    if seed.get("seeded")
+                    else f"postgres ready (count={seed.get('count')})"
+                )
+            )
+        elif seed.get("error") and seed.get("error") != "pg disabled":
+            print(f"  (models catalog seed skipped: {seed.get('error')})")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (models catalog seed skipped: {e})")
 
     try:
         from oidc_auth import normalize_auth_file_keys
@@ -263,9 +385,9 @@ def _on_startup() -> None:
         start_maintainers = True
 
     if start_maintainers:
-        # One-shot cleanup: permanently invalid refresh tokens leave rotation.
-        # Default is soft-disable (keep credentials). Hard delete only when
-        # GROK2API_DELETE_INVALID_REFRESH=1.
+        # One-shot cleanup: permanently invalid refresh tokens leave the pool.
+        # Default is hard-delete; set GROK2API_DELETE_INVALID_REFRESH=0 to
+        # soft-disable instead.
         try:
             from oidc_auth import purge_refresh_invalid_accounts
 
@@ -604,6 +726,16 @@ def _normalize_function_tool(t: dict[str, Any]) -> dict[str, Any] | None:
     return {"type": "function", "function": fn}
 
 
+def _tool_sort_key(tool: dict[str, Any]) -> str:
+    """Stable name for tool ordering (prefix-cache friendly)."""
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    if isinstance(fn, dict) and fn.get("name"):
+        return str(fn.get("name") or "").lower()
+    return str(tool.get("name") or "").lower()
+
+
 def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
     """
     Accept OpenAI Chat Completions tool shape and built-in tool types.
@@ -627,6 +759,9 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
     Therefore built-in search tools are **stripped** on this chat path so
     new-api / relays do not surface Upstream 422. Client function tools pass
     with parameters always filled.
+
+    Tools are sorted by function name so multi-turn requests with shuffled tool
+    arrays still share the same prompt prefix (automatic upstream cache).
     """
     if not tools:
         return tools
@@ -648,34 +783,53 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
         norm = _normalize_function_tool(t)
         if norm is not None:
             out.append(norm)
-    return out or None
+    if not out:
+        return None
+    # Stable order: same tool set → same schema bytes across turns.
+    out.sort(key=_tool_sort_key)
+    return out
 
 
 def _normalize_tool_choice(tool_choice: Any) -> Any:
     """
     Accept OpenAI Chat Completions tool_choice and map to upstream shape.
-    Supports: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
 
-    Built-in search tool_choice (web_search / live_search / …) is dropped —
-    upstream chat rejects or deprecates those variants.
+    Supports: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
+    Also accepts Responses/Anthropic-style flat forms:
+      {"type":"function","name":"Bash"} / {"type":"tool","name":"Bash"}
+
+    cli-chat-proxy often returns HTTP 200 with empty model output for nested
+    function-forced tool_choice. Prefer string "required" when a concrete tool
+    is forced — that path reliably yields tool_calls for Claude Code / sub2api.
     """
     if tool_choice is None:
         return None
     if isinstance(tool_choice, str):
-        return tool_choice.lower()
+        s = tool_choice.lower().strip()
+        if s in ("any", "tool"):
+            return "required"
+        return s or None
     if not isinstance(tool_choice, dict):
         return tool_choice
     tc_type = (tool_choice.get("type") or "function").lower()
     if tc_type in _BUILTIN_SEARCH_TOOL_TYPES:
         # Fall back to auto rather than forcing a deprecated live_search choice.
         return "auto"
+    if tc_type in ("auto", "none", "required"):
+        return tc_type
+    if tc_type in ("any", "tool"):
+        # Anthropic tool_choice type "any"/"tool" → force a tool call.
+        return "required"
     if tc_type != "function":
         # Unknown object choice — drop to auto to avoid upstream 422.
         return "auto"
-    fn = tool_choice.get("function")
-    if isinstance(fn, dict) and fn.get("name"):
-        return {"type": "function", "function": {"name": fn["name"]}}
-    return tool_choice
+    fn = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else {}
+    name = fn.get("name") or tool_choice.get("name")
+    if name:
+        # Forced named tool. Upstream empty-200s on nested function form often;
+        # "required" is accepted and still yields a tool call for Claude Code.
+        return "required"
+    return "auto"
 
 
 def _message_to_upstream(m: ChatMessage) -> dict[str, Any]:
@@ -768,6 +922,9 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
     _sanitize_upstream_body(body, model=model)
     # Secondary relays (newapi/sub2api) rely on final stream usage for billing.
     _ensure_stream_include_usage(body)
+    # Canonicalize tools/messages formatting BEFORE compact so rewrites are
+    # applied to a stable base (prefix-cache hit conditions).
+    _stabilize_upstream_prompt_body(body)
     # Long Claude Code tool loops → huge bodies; compact past tool results.
     _apply_history_compact(body)
     return body
@@ -823,6 +980,7 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
     """Drop/clamp fields that cli-chat-proxy rejects for Grok models."""
     # Internal bookkeeping must never reach upstream.
     body.pop("_history_compact", None)
+    body.pop("_prompt_stabilize", None)
     body.pop("_prompt_cache_key", None)
     body.pop("_prompt_cache_retention", None)
     # Deprecated live-search knobs → 410 on current cli-chat-proxy builds.
@@ -866,6 +1024,7 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
 
     # Final tools scrub: chat/completions only allows function tools, and each
     # function tool must include `parameters` (upstream 422 otherwise).
+    # Re-sort by name so multi-turn tool arrays stay prefix-stable.
     tools = body.get("tools")
     if isinstance(tools, list):
         cleaned: list[Any] = []
@@ -878,6 +1037,7 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
             if norm is not None:
                 cleaned.append(norm)
         if cleaned:
+            cleaned.sort(key=_tool_sort_key)
             body["tools"] = cleaned
         else:
             body.pop("tools", None)
@@ -909,21 +1069,33 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
     tc = body.get("tool_choice")
     if isinstance(tc, dict):
         tc_type = (tc.get("type") or "function").lower()
-        if tc_type in ("auto", "none", "required", "any"):
-            # Responses / Anthropic-style {"type":"auto"} → OpenAI string form.
-            body["tool_choice"] = "required" if tc_type == "any" else tc_type
+        if tc_type in ("auto", "none", "required", "any", "tool"):
+            # Responses / Anthropic-style {"type":"auto"|"any"|"tool"} → string form.
+            # "any"/"tool" both mean "must call a tool".
+            body["tool_choice"] = (
+                "required" if tc_type in ("any", "tool") else tc_type
+            )
         elif tc_type != "function":
             body["tool_choice"] = "auto"
         else:
             fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
             name = fn.get("name") or tc.get("name")
             if name:
-                body["tool_choice"] = {
-                    "type": "function",
-                    "function": {"name": name},
-                }
+                # IMPORTANT: cli-chat-proxy frequently returns HTTP 200 with empty
+                # model output for nested {"type":"function","function":{"name":…}}.
+                # sub2api sends this for Claude Code tool_choice forced tools and
+                # then relays an empty Anthropic envelope (message_start/stop only),
+                # which Claude Code reports as empty/malformed HTTP 200.
+                # String "required" is accepted and reliably yields tool_calls.
+                body["tool_choice"] = "required"
             else:
                 body["tool_choice"] = "auto"
+    elif isinstance(tc, str):
+        s = tc.lower().strip()
+        if s in ("any", "tool"):
+            body["tool_choice"] = "required"
+        elif s:
+            body["tool_choice"] = s
 
     # Codex compact / pure-text turns often send tool_choice without tools.
     # Upstream cli-chat-proxy rejects that with 400:
@@ -932,6 +1104,324 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
         body.pop("tool_choice", None)
         body.pop("function_call", None)
         body.pop("parallel_tool_calls", None)
+
+
+def _canonicalize_json_value(value: Any) -> Any:
+    """Recursively sort object keys so identical schemas serialize identically."""
+    if isinstance(value, dict):
+        # Stable key order: plain sorted() is enough for ASCII schema keys.
+        return {k: _canonicalize_json_value(value[k]) for k in sorted(value.keys(), key=str)}
+    if isinstance(value, list):
+        return [_canonicalize_json_value(v) for v in value]
+    return value
+
+
+def _canonical_json_text(raw: Any) -> str | None:
+    """Return compact, key-sorted JSON text when ``raw`` is a JSON object/array.
+
+    Used to neutralize pretty-print / key-order churn in tool arguments so the
+    multi-turn prompt *prefix* stays byte-stable (automatic upstream cache).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        try:
+            return json.dumps(
+                _canonicalize_json_value(raw),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text or text[0] not in "{[":
+        return None
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, (dict, list)):
+        return None
+    try:
+        return json.dumps(
+            _canonicalize_json_value(parsed),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _stabilize_tool_parameters(params: Any) -> dict[str, Any]:
+    base = _ensure_tool_parameters(params)
+    canon = _canonicalize_json_value(base)
+    return canon if isinstance(canon, dict) else base
+
+
+def _stabilize_tool_calls(tool_calls: Any) -> list[Any] | None:
+    """Normalize assistant tool_calls for prefix stability (no reordering).
+
+    Order of tool_calls is preserved — it must stay aligned with subsequent
+    tool result messages. Only argument JSON formatting is canonicalized.
+    """
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return tool_calls if isinstance(tool_calls, list) else None
+    out: list[Any] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        item = dict(tc)
+        # Drop volatile extras some relays inject.
+        for drop in ("index", "extra_content", "thought_signature"):
+            # Keep "index" only if present as int and needed? OpenAI stream uses
+            # index; for history messages it's optional. Dropping index improves
+            # stability when some turns include it and some don't.
+            item.pop(drop, None)
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            fn2 = dict(fn)
+            args = fn2.get("arguments")
+            canon = _canonical_json_text(args)
+            if canon is not None:
+                fn2["arguments"] = canon
+            elif args is None:
+                fn2["arguments"] = "{}"
+            elif not isinstance(args, str):
+                # Coerce non-string args to compact JSON when possible.
+                c2 = _canonical_json_text(args)
+                fn2["arguments"] = c2 if c2 is not None else str(args)
+            item["function"] = fn2
+        # Stable field order for serialization locality (role/content handled elsewhere).
+        ordered: dict[str, Any] = {}
+        if item.get("id") is not None:
+            ordered["id"] = item.get("id")
+        ordered["type"] = item.get("type") or "function"
+        if "function" in item:
+            ordered["function"] = item["function"]
+        for k, v in item.items():
+            if k not in ordered:
+                ordered[k] = v
+        out.append(ordered)
+    return out
+
+
+def _stabilize_text_content(text: str, *, role: str) -> str:
+    """Normalize text content for prefix stability without changing meaning.
+
+    For system prompts, collapse trailing blank lines / CRLF so clients that
+    send ``str`` vs ``[{type:text}]`` still share the same prefix bytes.
+    Non-system text is left intact (tool outputs / user code may be whitespace-
+    sensitive).
+    """
+    if not isinstance(text, str):
+        return str(text or "")
+    if role != "system":
+        return text
+    norm = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Keep at most one trailing newline for system prompts.
+    had_trailing_nl = norm.endswith("\n")
+    norm = norm.rstrip("\n").rstrip()
+    if had_trailing_nl or text.endswith("\n"):
+        return norm + "\n" if norm else ""
+    return norm
+
+
+def _stabilize_message_for_cache(msg: Any) -> Any:
+    """Normalize one chat message so multi-turn prefixes stay comparable."""
+    if not isinstance(msg, dict):
+        return msg
+    role = (msg.get("role") or "").strip() or "user"
+    out: dict[str, Any] = {"role": role}
+
+    # Preserve name / tool_call_id when present (tool rounds need them).
+    if msg.get("name") not in (None, ""):
+        out["name"] = msg.get("name")
+    if msg.get("tool_call_id") not in (None, ""):
+        out["tool_call_id"] = msg.get("tool_call_id")
+
+    tcs = msg.get("tool_calls")
+    if isinstance(tcs, list) and tcs:
+        out["tool_calls"] = _stabilize_tool_calls(tcs)
+
+    fc = msg.get("function_call")
+    if isinstance(fc, dict) and fc.get("name"):
+        fc2 = {"name": fc.get("name")}
+        args = fc.get("arguments")
+        canon = _canonical_json_text(args)
+        if canon is not None:
+            fc2["arguments"] = canon
+        elif args is not None:
+            fc2["arguments"] = args if isinstance(args, str) else str(args)
+        else:
+            fc2["arguments"] = "{}"
+        out["function_call"] = fc2
+
+    content = msg.get("content")
+    if content is None:
+        # OpenAI: assistant+tool_calls may use content=null; keep that shape.
+        if out.get("tool_calls") or out.get("function_call"):
+            out["content"] = None
+        elif role == "tool":
+            out["content"] = ""
+        else:
+            out["content"] = ""
+    elif isinstance(content, str):
+        out["content"] = _stabilize_text_content(content, role=role)
+    elif isinstance(content, list):
+        # Multimodal / content parts: keep order, drop empty text-only noise parts.
+        parts: list[Any] = []
+        for part in content:
+            if isinstance(part, str):
+                if part != "":
+                    parts.append({"type": "text", "text": part})
+                continue
+            if not isinstance(part, dict):
+                parts.append(part)
+                continue
+            p = dict(part)
+            ptype = (p.get("type") or "text").lower()
+            if ptype in ("text", "input_text", "output_text"):
+                text = p.get("text")
+                if text is None:
+                    continue
+                parts.append({"type": "text", "text": str(text)})
+            elif ptype in ("image_url", "image"):
+                # Keep image parts as-is (URLs/base64 are content-critical).
+                parts.append(p)
+            else:
+                parts.append(p)
+        if not parts:
+            out["content"] = ""
+        elif all(
+            isinstance(p, dict) and p.get("type") == "text" for p in parts
+        ):
+            # Flatten pure-text part lists to a single string — many clients
+            # alternate str vs [{type:text}] for the same system/user content.
+            joined = "\n".join(str(p.get("text") or "") for p in parts)
+            out["content"] = _stabilize_text_content(joined, role=role)
+        else:
+            out["content"] = parts
+    elif isinstance(content, dict):
+        # Rare: single content object — stringify deterministically when possible.
+        if content.get("type") in ("text", "input_text") and "text" in content:
+            out["content"] = _stabilize_text_content(
+                str(content.get("text") or ""), role=role
+            )
+        else:
+            canon = _canonical_json_text(content)
+            out["content"] = canon if canon is not None else content
+    else:
+        out["content"] = content
+
+    # Pass through reasoning_content only when non-empty (some clients omit it
+    # on later turns; including empty would break prefix equality).
+    rc = msg.get("reasoning_content")
+    if isinstance(rc, str) and rc.strip():
+        out["reasoning_content"] = rc
+
+    return out
+
+
+def _stabilize_upstream_prompt_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Create automatic prefix-cache hit conditions on the outbound body.
+
+    Mirrors what superagent-ai/grok-cli effectively does by replaying a stable
+    local transcript: same tools schema bytes + same message prefix shape.
+    Does **not** invent conversation history — only canonicalizes formatting.
+    """
+    if not isinstance(body, dict):
+        return {"messages_stabilized": 0, "tools_stabilized": 0}
+
+    stats = {
+        "messages_stabilized": 0,
+        "tools_stabilized": 0,
+        "tool_args_canonicalized": 0,
+    }
+
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        cleaned: list[Any] = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            norm = _normalize_function_tool(t)
+            if norm is None:
+                continue
+            fn = norm.get("function")
+            if isinstance(fn, dict):
+                fn = dict(fn)
+                fn["parameters"] = _stabilize_tool_parameters(fn.get("parameters"))
+                # Drop description key when empty so presence/absence doesn't churn.
+                if fn.get("description") in (None, ""):
+                    fn.pop("description", None)
+                # Stable function key order.
+                ordered_fn: dict[str, Any] = {"name": fn.get("name")}
+                if "description" in fn:
+                    ordered_fn["description"] = fn["description"]
+                ordered_fn["parameters"] = fn.get("parameters") or _empty_tool_parameters()
+                for k, v in fn.items():
+                    if k not in ordered_fn:
+                        ordered_fn[k] = v
+                norm = {"type": "function", "function": ordered_fn}
+            cleaned.append(norm)
+        cleaned.sort(key=_tool_sort_key)
+        body["tools"] = cleaned
+        stats["tools_stabilized"] = len(cleaned)
+
+    funcs = body.get("functions")
+    if isinstance(funcs, list) and funcs:
+        fixed: list[Any] = []
+        for f in funcs:
+            if not isinstance(f, dict) or not f.get("name"):
+                continue
+            fn = dict(f)
+            fn["parameters"] = _stabilize_tool_parameters(
+                fn.get("parameters") if fn.get("parameters") is not None else fn.get("input_schema")
+            )
+            fn.pop("input_schema", None)
+            if fn.get("description") in (None, ""):
+                fn.pop("description", None)
+            ordered = {"name": fn.get("name")}
+            if "description" in fn:
+                ordered["description"] = fn["description"]
+            ordered["parameters"] = fn.get("parameters") or _empty_tool_parameters()
+            for k, v in fn.items():
+                if k not in ordered:
+                    ordered[k] = v
+            fixed.append(ordered)
+        fixed.sort(key=lambda x: str(x.get("name") or "").lower())
+        body["functions"] = fixed
+
+    messages = body.get("messages")
+    if isinstance(messages, list) and messages:
+        new_msgs: list[Any] = []
+        for m in messages:
+            sm = _stabilize_message_for_cache(m)
+            if (
+                isinstance(sm, dict)
+                and isinstance(sm.get("tool_calls"), list)
+            ):
+                # Count args we rewrote (heuristic: compact form).
+                for tc in sm["tool_calls"]:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function")
+                    if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                        stats["tool_args_canonicalized"] += 1
+            new_msgs.append(sm)
+            stats["messages_stabilized"] += 1
+        body["messages"] = new_msgs
+
+    # Drop client fields that are not part of the model prompt but sometimes
+    # confuse secondary relays / get echoed into logs only.
+    # (Do not drop model/stream/tools/messages.)
+    body.pop("metadata", None)
+
+    body["_prompt_stabilize"] = stats
+    return stats
 
 
 def _ensure_stream_include_usage(body: dict[str, Any]) -> None:
@@ -953,6 +1443,7 @@ def _body_for_upstream(body: dict[str, Any]) -> dict[str, Any]:
         return body
     out = dict(body)
     out.pop("_history_compact", None)
+    out.pop("_prompt_stabilize", None)
     return out
 
 
@@ -977,7 +1468,107 @@ def _history_compact_headers(body: dict[str, Any]) -> dict[str, str]:
         hdr["X-Grok2API-History-After"] = str(stats.get("after_chars"))
     if stats.get("tool_rounds") is not None:
         hdr["X-Grok2API-History-Tool-Rounds"] = str(stats.get("tool_rounds"))
+    if stats.get("prefix_stable") is not None:
+        hdr["X-Grok2API-History-Prefix-Stable"] = (
+            "1" if stats.get("prefix_stable") else "0"
+        )
     return hdr
+
+
+def _prompt_stabilize_headers(body: dict[str, Any]) -> dict[str, str]:
+    """Expose outbound prompt stabilization stats for cache-hit debugging."""
+    stats = body.get("_prompt_stabilize") if isinstance(body, dict) else None
+    if not isinstance(stats, dict):
+        return {"X-Grok2API-Prompt-Stable": "0"}
+    return {
+        "X-Grok2API-Prompt-Stable": "1",
+        "X-Grok2API-Prompt-Stable-Messages": str(stats.get("messages_stabilized") or 0),
+        "X-Grok2API-Prompt-Stable-Tools": str(stats.get("tools_stabilized") or 0),
+    }
+
+
+def _cache_debug_headers(usage: dict[str, Any] | None) -> dict[str, str]:
+    """Response headers for cache-hit observability (SSE + JSON)."""
+    cached = _cache_tokens_from_usage(usage)
+    hdr = {"X-Grok2API-Cache-Read-Tokens": str(int(cached))}
+    prompt = 0
+    if isinstance(usage, dict):
+        try:
+            prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        except (TypeError, ValueError):
+            prompt = 0
+    if prompt > 0 and cached > 0:
+        ratio = min(1.0, cached / float(prompt))
+        hdr["X-Grok2API-Cache-Hit-Ratio"] = f"{ratio:.4f}"
+    else:
+        hdr["X-Grok2API-Cache-Hit-Ratio"] = "0"
+    return hdr
+
+
+def _cache_tokens_from_usage(usage: dict[str, Any] | None) -> int:
+    """Best-effort cached prompt tokens from a normalized or raw usage dict."""
+    if not isinstance(usage, dict):
+        return 0
+    return int(
+        _usage_detail_int(
+            usage,
+            ("prompt_tokens_details", "cached_tokens"),
+            ("input_tokens_details", "cached_tokens"),
+            "cached_tokens",
+            "cache_read_input_tokens",
+            "prompt_cache_hit_tokens",
+            "cache_read_tokens",
+        )
+        or 0
+    )
+
+
+def _attach_cache_debug_fields(
+    result: dict[str, Any],
+    usage: dict[str, Any] | None,
+    *,
+    prefer_account: bool | None = None,
+) -> None:
+    """Non-standard response fields so ops can see cache hits without log diving."""
+    if not isinstance(result, dict):
+        return
+    cached = _cache_tokens_from_usage(usage if isinstance(usage, dict) else result.get("usage"))
+    result["x_grok2api_cache_read_tokens"] = int(cached)
+    prompt = 0
+    u = usage if isinstance(usage, dict) else result.get("usage")
+    if isinstance(u, dict):
+        try:
+            prompt = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
+        except (TypeError, ValueError):
+            prompt = 0
+    if prompt > 0 and cached > 0:
+        result["x_grok2api_cache_hit_ratio"] = round(min(1.0, cached / float(prompt)), 4)
+    else:
+        result["x_grok2api_cache_hit_ratio"] = 0.0
+    if prefer_account is not None:
+        result["x_grok2api_affinity"] = bool(prefer_account)
+
+
+def _json_result_with_cache_headers(
+    result: dict[str, Any],
+    *,
+    body: dict[str, Any] | None = None,
+    prefer_account: bool | None = None,
+    conv_fp: str | None = None,
+    status_code: int = 200,
+) -> JSONResponse:
+    """Wrap a successful non-stream result with affinity / cache / compact headers."""
+    usage = result.get("usage") if isinstance(result, dict) else None
+    headers: dict[str, str] = {}
+    if prefer_account is not None:
+        headers["X-Grok2API-Affinity"] = "1" if prefer_account else "0"
+    if conv_fp:
+        headers["X-Grok2API-Conversation-Fp"] = str(conv_fp)
+    headers.update(_cache_debug_headers(usage if isinstance(usage, dict) else None))
+    if isinstance(body, dict):
+        headers.update(_history_compact_headers(body))
+        headers.update(_prompt_stabilize_headers(body))
+    return JSONResponse(content=result, status_code=status_code, headers=headers)
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -1435,6 +2026,15 @@ def _record_usage_safe(
         import usage_stats
 
         ctx = _usage_request_ctx.get() or {}
+        # Failed rows with null error/status make admin "断联" debugging opaque
+        # (looks like a silent drop). Always stamp a reason + status on !ok.
+        err_out = error
+        status_out = status_code
+        if not ok:
+            if err_out is None or not str(err_out).strip():
+                err_out = "request_failed"
+            if status_out is None:
+                status_out = 502
         usage_stats.record_usage(
             usage=usage,
             ok=ok,
@@ -1446,9 +2046,9 @@ def _record_usage_safe(
             path=path or ctx.get("path"),
             client_ip=client_ip or ctx.get("client_ip"),
             user_agent=user_agent or ctx.get("user_agent"),
-            status_code=status_code,
+            status_code=status_out,
             latency_ms=latency_ms,
-            error=error,
+            error=err_out,
             detail=detail,
         )
     except Exception:
@@ -1463,6 +2063,70 @@ def _api_key_id(rec: apikeys.ApiKeyRecord | None) -> str | None:
         return None
     s = str(kid).strip()
     return s or None
+
+
+class _DisconnectProbe:
+    """Debounced client-disconnect probe for long SSE turns.
+
+    Starlette ``request.is_disconnected()`` can flip true once under write
+    backpressure or briefly when a proxy probes the socket, then go false
+    again. A single hit used to permanently set ``client_gone`` and hard-cut
+    mid-turn (Claude Code / sub2api stop scheduling).
+
+    Require several consecutive true hits **and** a minimum wall-clock span so
+    a single backpressure stall (many true probes within ~100ms) does not latch.
+    Probe exceptions never count.
+    """
+
+    def __init__(
+        self,
+        hits_needed: int | None = None,
+        min_span_sec: float | None = None,
+    ) -> None:
+        raw = hits_needed
+        if raw is None:
+            try:
+                raw = int(os.getenv("GROK2API_DISCONNECT_HITS", "3") or 3)
+            except (TypeError, ValueError):
+                raw = 3
+        self.hits_needed = max(1, min(8, int(raw)))
+        span = min_span_sec
+        if span is None:
+            try:
+                span = float(os.getenv("GROK2API_DISCONNECT_SPAN_SEC", "1.5") or 1.5)
+            except (TypeError, ValueError):
+                span = 1.5
+        self.min_span_sec = max(0.0, min(30.0, float(span)))
+        self.hits = 0
+        self.first_hit_at: float | None = None
+        self.gone = False
+
+    async def check(self, probe) -> bool:
+        if self.gone:
+            return True
+        if probe is None:
+            return False
+        try:
+            disconnected = await probe()
+        except Exception:
+            # Backpressure / closed-transport races: do not sticky-latch.
+            return False
+        if disconnected:
+            now = time.monotonic()
+            if self.first_hit_at is None:
+                self.first_hit_at = now
+            self.hits += 1
+            span_ok = (now - self.first_hit_at) >= self.min_span_sec
+            # hits_needed==1 keeps old "immediate" behaviour for tests/debug.
+            if self.hits >= self.hits_needed and (
+                self.hits_needed <= 1 or span_ok or self.min_span_sec <= 0
+            ):
+                self.gone = True
+                return True
+            return False
+        self.hits = 0
+        self.first_hit_at = None
+        return False
 
 
 async def _aiter_sse_lines_with_keepalive(
@@ -1761,9 +2425,16 @@ def _extract_delta_text(chunk: dict[str, Any]) -> tuple[str, str]:
     return content, reasoning
 
 
-def _coerce_tool_arguments(raw: Any) -> str:
-    """Normalize tool arguments to the OpenAI streaming string form."""
-    return anth.sanitize_tool_arguments_json(raw)
+def _coerce_tool_arguments(raw: Any, *, tool_name: str | None = None) -> str:
+    """Normalize tool arguments to the OpenAI streaming string form.
+
+    Prefer alias-aware normalize (path→file_path, oldString→old_string) so
+    Update/Edit readiness gates and outbound frames match Claude Code schema.
+    """
+    try:
+        return anth.normalize_tool_arguments_json(raw, tool_name=tool_name)
+    except Exception:
+        return anth.sanitize_tool_arguments_json(raw)
 
 
 def _merge_tool_arguments(
@@ -1866,15 +2537,19 @@ async def _emit_tool_sse_serial(
     created: int,
     tool_calls: list[Any],
     already_emitted: int = 0,
+    max_tools: int | None = None,
+    protocol: str | None = None,
 ) -> AsyncIterator[str]:
     """Yield tool SSE frames one-by-one with keepalive + optional real delay.
 
-    Respects OUTBOUND_MAX_TOOLS via remaining budget. Marks nothing in tool_acc —
+    Respects the protocol-aware outbound tool budget. Marks nothing in tool_acc —
     callers must only pass already-built outbound items.
     """
     if not tool_calls:
         return
-    budget = history_compact.remaining_outbound_tool_budget(already_emitted)
+    budget = history_compact.remaining_outbound_tool_budget(
+        already_emitted, max_tools=max_tools, protocol=protocol
+    )
     gap = float(getattr(history_compact, "OUTBOUND_TOOL_GAP_SEC", 0.0) or 0.0)
     first = True
     emitted_here = 0
@@ -1967,10 +2642,11 @@ def _ingest_tool_call_deltas(
                     entry["function"].get("name") or "", str(fn["name"])
                 )
             if fn.get("arguments") is not None:
+                _tn = entry["function"].get("name") or ""
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
-                    _coerce_tool_arguments(fn.get("arguments")),
-                    tool_name=entry["function"].get("name") or "",
+                    _coerce_tool_arguments(fn.get("arguments"), tool_name=_tn),
+                    tool_name=_tn,
                 )
         else:
             if raw.get("name"):
@@ -1978,16 +2654,18 @@ def _ingest_tool_call_deltas(
                     entry["function"].get("name") or "", str(raw["name"])
                 )
             if raw.get("arguments") is not None:
+                _tn = entry["function"].get("name") or ""
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
-                    _coerce_tool_arguments(raw.get("arguments")),
-                    tool_name=entry["function"].get("name") or "",
+                    _coerce_tool_arguments(raw.get("arguments"), tool_name=_tn),
+                    tool_name=_tn,
                 )
             elif raw.get("input") is not None:
+                _tn = entry["function"].get("name") or ""
                 entry["function"]["arguments"] = _merge_tool_arguments(
                     entry["function"].get("arguments") or "",
-                    _coerce_tool_arguments(raw.get("input")),
-                    tool_name=entry["function"].get("name") or "",
+                    _coerce_tool_arguments(raw.get("input"), tool_name=_tn),
+                    tool_name=_tn,
                 )
 
 
@@ -2071,10 +2749,14 @@ def _tool_call_argument_delta(
             break
 
         if not name:
-            # Known id without name — keep holding this slot.
+            # Name/id known but args incomplete — hold (do not open block early).
+            # Critical for Update/Edit: {"file_path":"..."} alone is NOT ready.
             if entry.get("id") or str(args).strip():
                 break
             continue
+        # Alias-normalize before readiness (path→file_path, oldString→old_string).
+        args = _coerce_tool_arguments(args, tool_name=name)
+        entry.setdefault("function", {})["arguments"] = args
         if not args or not anth.is_complete_tool_arguments_json(
             args, tool_name=name
         ):
@@ -2090,7 +2772,11 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
     """Flush at most one still-held tool (terminal / non-SSE safe for sub2api).
 
     Must not mark sibling tools as emitted — callers loop until empty.
-    Truncated upstream args still ship once as a single best-effort payload.
+
+    Prefer complete required-key payloads. Incomplete Update/Edit objects (only
+    file_path) are *not* shipped at terminal: better empty-turn failover than a
+    client-side wrong edit. Truncated non-JSON still ships once as best-effort
+    only when no required-key schema is known.
     """
     for idx in sorted(acc.keys()):
         entry = acc[idx]
@@ -2099,8 +2785,8 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
         fn = entry.get("function") or {}
         name = (fn.get("name") or "").strip()
         args = fn.get("arguments") or ""
-        if not isinstance(args, str):
-            args = _coerce_tool_arguments(args)
+        args = _coerce_tool_arguments(args, tool_name=name or None)
+        entry.setdefault("function", {})["arguments"] = args
         # Drop fully empty ghost slots.
         if not name and not entry.get("id") and not str(args).strip():
             continue
@@ -2108,9 +2794,16 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
             # Cannot open a useful tool_use without a name.
             continue
         remaining = str(args) if str(args).strip() else "{}"
-        # Terminal flush: still prefer required keys when possible, but if the
-        # stream ended with a partial object, ship best-effort rather than drop.
         if not anth.is_complete_tool_arguments_json(remaining, tool_name=name):
+            # Known schema incomplete (e.g. Update missing old/new) — drop rather
+            # than force a broken tool call that Claude Code will "run" wrong.
+            required = ()
+            try:
+                required = anth._required_keys_for_tool(name)  # type: ignore[attr-defined]
+            except Exception:
+                required = ()
+            if required:
+                continue
             remaining = str(args) if str(args).strip() else "{}"
         return [_build_outbound_tool_item(acc, entry, remaining=remaining)]
     return []
@@ -2118,12 +2811,15 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
 
 def _flush_tool_call_argument_deltas(
     acc: dict[int, dict[str, Any]],
+    *,
+    max_tools: int | None = None,
+    protocol: str | None = None,
 ) -> list[dict[str, Any]]:
     """Flush still-held tools as a list (one complete JSON blob per tool).
 
     Prefer _flush_one_tool_call + loop on the SSE path so sub2api never sees a
     multi-tool burst without per-tool framing. This helper remains for bulk
-    collection; OUTBOUND_MAX_TOOLS (default 1 for sub2api) can still cap the returned list
+    collection; the protocol-aware tool cap can still trim the returned list
     without marking unreturned siblings as emitted.
     """
     out: list[dict[str, Any]] = []
@@ -2132,7 +2828,9 @@ def _flush_tool_call_argument_deltas(
         if not one:
             break
         out.extend(one)
-    capped = history_compact.cap_outbound_tools(out)
+    capped = history_compact.cap_outbound_tools(
+        out, max_tools=max_tools, protocol=protocol
+    )
     if capped is None:
         return out
     if len(capped) < len(out):
@@ -2188,7 +2886,9 @@ def _legacy_function_call_to_tool_calls(function_call: Any) -> list[dict[str, An
             "type": "function",
             "function": {
                 "name": str(name or ""),
-                "arguments": _coerce_tool_arguments(args),
+                "arguments": _coerce_tool_arguments(
+                    args, tool_name=str(name or "") or None
+                ),
             },
         }
     ]
@@ -2241,7 +2941,10 @@ def _extract_delta_parts(
                     fn.get("arguments"), str
                 ):
                     fn = dict(fn)
-                    fn["arguments"] = _coerce_tool_arguments(fn.get("arguments"))
+                    _tn = str(fn.get("name") or item.get("name") or "") or None
+                    fn["arguments"] = _coerce_tool_arguments(
+                        fn.get("arguments"), tool_name=_tn
+                    )
                     item["function"] = fn
                 tool_calls.append(item)
         else:
@@ -2281,15 +2984,23 @@ def _finalize_tool_calls(
             continue
         tool_id = entry.get("id") or f"call_{uuid.uuid4().hex[:24]}"
         args = fn.get("arguments")
+        name = (fn.get("name") or "").strip()
         if args is None:
             args = ""
         else:
-            args = _coerce_tool_arguments(args)
+            args = _coerce_tool_arguments(args, tool_name=name or None)
         if isinstance(args, str) and not args.strip():
             args = "{}"
-        name = (fn.get("name") or "").strip()
         if not name:
             continue
+        # Skip schema-incomplete known tools (Update without old/new, etc.).
+        if not anth.is_complete_tool_arguments_json(str(args), tool_name=name):
+            try:
+                required = anth._required_keys_for_tool(name)  # type: ignore[attr-defined]
+            except Exception:
+                required = ()
+            if required:
+                continue
         out.append(
             {
                 "id": tool_id,
@@ -2574,22 +3285,94 @@ def _is_empty_model_payload(
     return True
 
 
+def _looks_like_gateway_intercept(raw: bytes | str | None) -> bool:
+    """Detect HTML / WAF / proxy interstitial bodies that arrive as HTTP 200."""
+    if raw is None:
+        return False
+    if isinstance(raw, bytes):
+        sample = raw[:800].decode("utf-8", errors="replace")
+    else:
+        sample = str(raw)[:800]
+    s = sample.lstrip().lower()
+    if not s:
+        return False
+    if s.startswith("<!doctype html") or s.startswith("<html"):
+        return True
+    markers = (
+        "cloudflare",
+        "cf-ray",
+        "attention required",
+        "access denied",
+        "just a moment",
+        "enable javascript",
+        "proxy authentication required",
+        "squid error",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "error code 5",
+        "nginx/",
+        "varnish cache server",
+    )
+    return any(m in s for m in markers)
+
+
+def _classify_upstream_body_error(
+    raw: bytes | str | None,
+    *,
+    content_type: str | None = None,
+) -> str | None:
+    """Return a retryable error message when body is empty / HTML / non-JSON."""
+    if raw is None:
+        return "Upstream returned HTTP 200 with empty body (no model output)"
+    if isinstance(raw, bytes):
+        if not raw or not raw.strip():
+            return "Upstream returned HTTP 200 with empty body (no model output)"
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = str(raw)
+        if not text.strip():
+            return "Upstream returned HTTP 200 with empty body (no model output)"
+    ctype = (content_type or "").lower()
+    if "text/html" in ctype or "application/xhtml" in ctype:
+        return (
+            "Upstream returned HTTP 200 HTML (proxy/gateway intercept?) — "
+            "not a model response"
+        )
+    if _looks_like_gateway_intercept(text):
+        preview = text.strip().replace("\n", " ")[:160]
+        return (
+            "Upstream returned HTTP 200 non-JSON body "
+            f"(proxy/gateway intercept?): {preview!r}"
+        )
+    return None
+
+
 def _resolve_conversation_affinity(
-    req: ChatCompletionRequest, request: Request
+    req: ChatCompletionRequest,
+    request: Request,
+    *,
+    api_key_id: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Returns (fingerprint, preferred_account_id).
     Same multi-turn chat → same fingerprint → sticky account
     (pool rotation will not switch accounts mid-conversation).
+
+    Prefer prompt_cache_key when present so OpenAI/sub2api multi-turn stays on
+    one account for prompt-cache locality.
     """
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
     ) or conversation_affinity.extract_conversation_id_from_body(req)
-    pck = conversation_affinity.extract_prompt_cache_key(req)
+    pck = conversation_affinity.extract_prompt_cache_key(
+        req
+    ) or conversation_affinity.extract_prompt_cache_key_from_headers(request.headers)
     fp = conversation_affinity.conversation_fingerprint(
         req.messages,
         user=req.user,
         conversation_id=conv_id,
+        api_key_id=api_key_id,
         prompt_cache_key=pck,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
@@ -2653,7 +3436,7 @@ async def chat_completions(
     key_id = _api_key_id(api_key)
     timing = RequestTiming(protocol="openai", stream=bool(req.stream))
     conv_fp, prefer_account = await asyncio.to_thread(
-        _resolve_conversation_affinity, req, request
+        _resolve_conversation_affinity, req, request, api_key_id=key_id
     )
     timing.mark_affinity(prefer_account)
     model = resolve_model(req.model)
@@ -2688,7 +3471,10 @@ async def chat_completions(
     timing.req_id = chat_id.replace("chatcmpl-", "")[:12]
     created = int(time.time())
 
-    compact_hdr = _history_compact_headers(body)
+    compact_hdr = {
+        **_history_compact_headers(body),
+        **_prompt_stabilize_headers(body),
+    }
     if req.stream:
         return StreamingResponse(
             _stream_proxy_with_failover(
@@ -2732,7 +3518,7 @@ async def chat_completions(
         try:
             timing.mark_upstream_start(account_id=creds.auth_key, attempt=attempt_i)
             content, reasoning, finish, usage, tool_calls = await _collect_completion(
-                url=url, headers=headers, body=body
+                url=url, headers=headers, body=body, account_id=creds.auth_key
             )
             timing.mark_upstream_headers()
             timing.mark_first_token(kind="content" if content else ("tool" if tool_calls else "done"))
@@ -2796,15 +3582,23 @@ async def chat_completions(
                 protocol="openai",
                 stream=False,
             )
-            # non-standard but useful for multi-account debugging
+            # non-standard but useful for multi-account / cache debugging
             result["x_grok2api_account"] = creds.email or creds.auth_key
-            result["x_grok2api_affinity"] = bool(prefer_account)
+            _attach_cache_debug_fields(
+                result, result.get("usage"), prefer_account=bool(prefer_account)
+            )
             hc_stats = body.get("_history_compact") if isinstance(body, dict) else None
             if isinstance(hc_stats, dict):
                 result["x_grok2api_history_compact"] = hc_stats
             if conv_fp:
                 result["x_grok2api_conversation_fp"] = conv_fp
-            return result
+            timing.emit(ok=True)
+            return _json_result_with_cache_headers(
+                result,
+                body=body,
+                prefer_account=bool(prefer_account),
+                conv_fp=conv_fp,
+            )
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
             detail = e.response.text[:800] if e.response is not None else str(e)
@@ -2953,6 +3747,7 @@ async def _stream_proxy_with_failover_inner(
     conversation_fp: str | None = None,
     api_key_id: str | None = None,
     timing: RequestTiming | None = None,
+    protocol: str = "openai",
 ) -> AsyncIterator[str]:
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
@@ -2966,6 +3761,8 @@ async def _stream_proxy_with_failover_inner(
     # (still counted in usage). Incomplete tool previews must not release the
     # hold or open a text block before the first tool frame.
     tools_requested = _body_requests_tools(body)
+    # Pure OpenAI chat defaults to unlimited tools; Claude/sub2api stay capped.
+    outbound_max_tools = history_compact.resolve_outbound_max_tools(protocol)
 
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
@@ -2975,11 +3772,12 @@ async def _stream_proxy_with_failover_inner(
         held_finish: str | None = None
         stream_started = False  # True once any content has been sent to client
         client_gone = False
+        disconnect = _DisconnectProbe()
         usage: dict[str, Any] | None = None
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, Any]] = {}
-        tools_emitted_count = 0  # enforces OUTBOUND_MAX_TOOLS across the turn
+        tools_emitted_count = 0  # enforces outbound tool cap across the turn
         reasoning_compat = _ReasoningCompatState()
         # Buffered pre-tool emissions (OpenAI path only). Flushed only if the
         # turn ends without any outbound tool frames.
@@ -2988,7 +3786,7 @@ async def _stream_proxy_with_failover_inner(
             if timing is not None:
                 timing.mark_upstream_start(account_id=creds.auth_key, attempt=idx)
             upstream_body = _body_for_upstream(body)
-            client = await get_http_client()
+            client = await get_http_client(creds.auth_key)
             async with client.stream(
                 "POST", url, headers=headers, json=upstream_body
             ) as resp:
@@ -3084,11 +3882,9 @@ async def _stream_proxy_with_failover_inner(
                     async for line in _aiter_sse_lines_with_keepalive(resp):
                         # Soft disconnect check: keep draining so we can still
                         # emit a terminal finish/tool_calls frame when possible.
-                        try:
-                            if await client_disconnected():
-                                client_gone = True
-                        except Exception:
-                            client_gone = True
+                        # Debounced: a single is_disconnected() blip under
+                        # backpressure must not sticky-latch client_gone.
+                        client_gone = await disconnect.check(client_disconnected)
                         if line is None:
                             # idle keepalive for newapi / reverse proxies
                             if not client_gone:
@@ -3135,7 +3931,9 @@ async def _stream_proxy_with_failover_inner(
                             # Remaining tools emit on later ticks / terminal
                             # flush, still one frame at a time.
                             budget = history_compact.remaining_outbound_tool_budget(
-                                tools_emitted_count
+                                tools_emitted_count,
+                                max_tools=outbound_max_tools,
+                                protocol=protocol,
                             )
                             if budget is not None and budget <= 0:
                                 # Cap reached: still ingest for accounting, no emit.
@@ -3187,11 +3985,10 @@ async def _stream_proxy_with_failover_inner(
                             # text/reasoning (avoids content_block clashes).
                             emit_content, emit_reasoning = None, None
 
-                        if content or reasoning or tool_calls or finish:
-                            # Any real model payload counts as stream progress.
-                            # Role-only is not enough (empty 200 after role).
-                            stream_started = True
-                            _note_success_once()
+                        # Incomplete tool-name previews must NOT set stream_started or bind
+                        # success/affinity. Only outbound frames that are actually
+                        # yielded count as client-visible model bytes — do not
+                        # mark started when client_gone skips the yield below.
                         if finish:
                             # Hold finish until stream drain so we can attach
                             # usage on the same terminal chunk. sub2api/new-api
@@ -3221,9 +4018,13 @@ async def _stream_proxy_with_failover_inner(
                                     )
 
                         if emit_content or emit_reasoning or emit_tool_calls:
-                            stream_started = True
                             if client_gone:
                                 continue
+                            # Only after we know we will yield: bind success and
+                            # lock failover. Premature stream_started + client_gone
+                            # used to block silent account failover on empty turns.
+                            stream_started = True
+                            _note_success_once()
                             # Split content/reasoning and tool_calls into separate
                             # SSE frames. sub2api/Claude Code converters that open
                             # text then tool from one mixed delta can leave the
@@ -3251,6 +4052,8 @@ async def _stream_proxy_with_failover_inner(
                                     created=created,
                                     tool_calls=emit_tool_calls,
                                     already_emitted=tools_emitted_count,
+                                    max_tools=outbound_max_tools,
+                                    protocol=protocol,
                                 ):
                                     yield _tc_frame
                                     if _tc_frame.startswith("data: "):
@@ -3263,7 +4066,9 @@ async def _stream_proxy_with_failover_inner(
                                 # one window but we only emit one per upstream line.
                                 while True:
                                     _budget2 = history_compact.remaining_outbound_tool_budget(
-                                        tools_emitted_count
+                                        tools_emitted_count,
+                                        max_tools=outbound_max_tools,
+                                        protocol=protocol,
                                     )
                                     if _budget2 is not None and _budget2 <= 0:
                                         break
@@ -3279,6 +4084,8 @@ async def _stream_proxy_with_failover_inner(
                                         created=created,
                                         tool_calls=more,
                                         already_emitted=tools_emitted_count,
+                                        max_tools=outbound_max_tools,
+                                        protocol=protocol,
                                     ):
                                         yield _tc_frame
                                         if _tc_frame.startswith("data: "):
@@ -3288,21 +4095,21 @@ async def _stream_proxy_with_failover_inner(
                             continue
                 else:
                     raw = await resp.aread()
+                    body_err = _classify_upstream_body_error(
+                        raw,
+                        content_type=resp.headers.get("content-type"),
+                    )
+                    if body_err:
+                        raise RuntimeError(body_err)
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
-                        text = raw.decode("utf-8", errors="replace")
-                        content_parts.append(text)
-                        stream_started = True
-                        if not client_gone:
-                            yield _sse_chunk(
-                                chat_id=chat_id,
-                                model=model,
-                                created=created,
-                                content=text,
-                            )
-                        finished = True
-                        held_finish = "stop"
+                        # Non-JSON 200 that isn't obvious HTML: still retryable.
+                        preview = raw[:200].decode("utf-8", errors="replace")
+                        raise RuntimeError(
+                            "Upstream returned HTTP 200 with non-JSON body "
+                            f"(empty/malformed): {preview!r}"
+                        )
                     else:
                         if isinstance(data.get("usage"), dict):
                             usage = data["usage"]
@@ -3368,7 +4175,11 @@ async def _stream_proxy_with_failover_inner(
                             content_parts.append(content)
                         if reasoning:
                             reasoning_parts.append(reasoning)
-                        stream_started = True
+                        # Only mark progress when there is real payload — empty
+                        # JSON 200 with finish_reason alone must remain failoverable.
+                        if content or reasoning or sanitized_tc or msg_tool_calls:
+                            stream_started = True
+                            _note_success_once()
                         emit_content, emit_reasoning = reasoning_compat.rewrite(
                             content if content else None,
                             reasoning if reasoning else None,
@@ -3389,12 +4200,15 @@ async def _stream_proxy_with_failover_inner(
                         # Tools first, then content only if this is a non-tool turn.
                         if sanitized_tc and not client_gone:
                             saw_tool_calls = True
+                            stream_started = True
                             async for _tc_frame in _emit_tool_sse_serial(
                                 chat_id=chat_id,
                                 model=model,
                                 created=created,
                                 tool_calls=sanitized_tc,
                                 already_emitted=tools_emitted_count,
+                                max_tools=outbound_max_tools,
+                                protocol=protocol,
                             ):
                                 yield _tc_frame
                                 if _tc_frame.startswith("data: "):
@@ -3430,7 +4244,9 @@ async def _stream_proxy_with_failover_inner(
                 # active content_block). Keepalive + wall-clock gap between tools.
                 while True:
                     budget = history_compact.remaining_outbound_tool_budget(
-                        tools_emitted_count
+                        tools_emitted_count,
+                        max_tools=outbound_max_tools,
+                        protocol=protocol,
                     )
                     if budget is not None and budget <= 0:
                         break
@@ -3446,6 +4262,8 @@ async def _stream_proxy_with_failover_inner(
                         created=created,
                         tool_calls=one,
                         already_emitted=tools_emitted_count,
+                        max_tools=outbound_max_tools,
+                        protocol=protocol,
                     ):
                         yield _tc_frame
                         if _tc_frame.startswith("data: "):
@@ -3536,35 +4354,42 @@ async def _stream_proxy_with_failover_inner(
                 tool_calls=final_tc if saw_tool_calls else None,
                 usage=usage,
             )
-            if not client_gone:
-                # Non-tool turn with tools_requested: flush held preface now.
-                # After flush above, saw_tool_calls is the source of truth —
-                # incomplete tool previews that never became outbound frames
-                # must not swallow a normal text answer.
-                if held_pre_tool and not saw_tool_calls:
-                    for held_c, held_r in held_pre_tool:
-                        if held_c or held_r:
-                            stream_started = True
-                            yield _sse_chunk(
-                                chat_id=chat_id,
-                                model=model,
-                                created=created,
-                                content=held_c,
-                                reasoning=held_r,
-                            )
+            # Soft disconnect must still close the SSE envelope. Skipping finish /
+            # [DONE] after mid-stream content is the intermittent "hard cut" that
+            # makes sub2api/Claude Code stop scheduling further turns.
+            try:
+                if not client_gone:
+                    # Non-tool turn with tools_requested: flush held preface now.
+                    # After flush above, saw_tool_calls is the source of truth —
+                    # incomplete tool previews that never became outbound frames
+                    # must not swallow a normal text answer.
+                    if held_pre_tool and not saw_tool_calls:
+                        for held_c, held_r in held_pre_tool:
+                            if held_c or held_r:
+                                stream_started = True
+                                yield _sse_chunk(
+                                    chat_id=chat_id,
+                                    model=model,
+                                    created=created,
+                                    content=held_c,
+                                    reasoning=held_r,
+                                )
+                        held_pre_tool.clear()
+                    elif held_pre_tool and saw_tool_calls:
+                        held_pre_tool.clear()
+                    close_tag = reasoning_compat.close_tag_chunk()
+                    if close_tag and not (tools_requested and saw_tool_calls):
+                        yield _sse_chunk(
+                            chat_id=chat_id,
+                            model=model,
+                            created=created,
+                            content=close_tag,
+                        )
+                elif held_pre_tool:
                     held_pre_tool.clear()
-                elif held_pre_tool and saw_tool_calls:
-                    held_pre_tool.clear()
-                close_tag = reasoning_compat.close_tag_chunk()
-                if close_tag and not (tools_requested and saw_tool_calls):
-                    yield _sse_chunk(
-                        chat_id=chat_id,
-                        model=model,
-                        created=created,
-                        content=close_tag,
-                    )
                 # Single terminal finish frame WITH usage (Scheme A). This is the
                 # chunk secondary relays like sub2api inspect for token billing.
+                # Always emit once the upstream turn ends (even if client_gone).
                 yield _sse_chunk(
                     chat_id=chat_id,
                     model=model,
@@ -3582,6 +4407,9 @@ async def _stream_proxy_with_failover_inner(
                     include_choices=False,
                 )
                 yield "data: [DONE]\n\n"
+            except Exception:
+                # Client socket already gone — nothing more we can ship.
+                pass
             _record_usage_safe(
                 usage=norm_usage,
                 ok=True,
@@ -3616,9 +4444,10 @@ async def _stream_proxy_with_failover_inner(
                 model=model,
             )
             last_err = str(e)
-            # Never failover after bytes were already streamed to the client —
-            # secondary relays treat that as a mid-stream corruption / break.
-            if stream_started or role_sent:
+            # Failover is still safe after role-only frames (no model bytes).
+            # Only block failover once real content/tool frames were sent —
+            # secondary relays treat mid-stream account switches as corruption.
+            if stream_started:
                 _record_usage_safe(
                     ok=False,
                     api_key_id=api_key_id,
@@ -3670,7 +4499,11 @@ async def _stream_proxy_with_failover_inner(
 
 
 async def _collect_completion(
-    *, url: str, headers: dict[str, str], body: dict[str, Any]
+    *,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    account_id: str | None = None,
 ) -> tuple[
     str,
     str,
@@ -3690,7 +4523,7 @@ async def _collect_completion(
     req_body = _body_for_upstream(body)
     _ensure_stream_include_usage(req_body)
 
-    client = await get_http_client()
+    client = await get_http_client(account_id)
     async with client.stream("POST", url, headers=headers, json=req_body) as resp:
         if resp.status_code >= 400:
             raw = await resp.aread()
@@ -3738,15 +4571,19 @@ async def _collect_completion(
                         ]
         else:
             raw = await resp.aread()
-            if not raw or not raw.strip():
-                raise RuntimeError(
-                    "Upstream returned HTTP 200 with empty body (no model output)"
-                )
+            body_err = _classify_upstream_body_error(
+                raw,
+                content_type=resp.headers.get("content-type"),
+            )
+            if body_err:
+                raise RuntimeError(body_err)
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError as e:
+                preview = raw[:200].decode("utf-8", errors="replace")
                 raise RuntimeError(
-                    f"Upstream returned HTTP 200 with non-JSON body: {raw[:200]!r}"
+                    "Upstream returned HTTP 200 with non-JSON body "
+                    f"(empty/malformed): {preview!r}"
                 ) from e
             if isinstance(data.get("usage"), dict):
                 usage = data["usage"]
@@ -3802,7 +4639,10 @@ async def _collect_completion(
 
 
 def _resolve_anthropic_affinity(
-    req: anth.AnthropicMessagesRequest, request: Request
+    req: anth.AnthropicMessagesRequest,
+    request: Request,
+    *,
+    api_key_id: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Fingerprint for sticky multi-turn on Anthropic-shaped requests."""
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
@@ -3814,15 +4654,18 @@ def _resolve_anthropic_affinity(
                 conv_id = str(req.metadata[k])
                 break
     oa_msgs = anth.affinity_messages_from_request(req)
-    # Prefer explicit metadata cache/session keys; fall back to cache_control
-    # fingerprint derived from system/tools so Claude Code multi-turn sticks.
-    pck = conversation_affinity.extract_prompt_cache_key(req)
+    # Prefer explicit metadata cache/session keys / headers; fall back to
+    # cache_control fingerprint derived from system/tools so Claude Code sticks.
+    pck = conversation_affinity.extract_prompt_cache_key(
+        req
+    ) or conversation_affinity.extract_prompt_cache_key_from_headers(request.headers)
     if not pck:
         pck = anth.extract_anthropic_prompt_cache_key(req)
     fp = conversation_affinity.conversation_fingerprint(
         oa_msgs,
         user=anth.metadata_user_id(req),
         conversation_id=conv_id,
+        api_key_id=api_key_id,
         prompt_cache_key=pck,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
@@ -3879,7 +4722,7 @@ async def anthropic_messages(
 
     timing = RequestTiming(protocol="anthropic", stream=bool(req.stream))
     conv_fp, prefer_account = await asyncio.to_thread(
-        _resolve_anthropic_affinity, req, request
+        _resolve_anthropic_affinity, req, request, api_key_id=key_id
     )
     timing.mark_affinity(prefer_account)
     model = resolve_model(req.model)
@@ -3898,6 +4741,8 @@ async def anthropic_messages(
         # the OpenAI path so upstream never sees tools without `parameters`.
         _sanitize_upstream_body(body_local, model=model)
         _ensure_stream_include_usage(body_local)
+        # Same prefix-stable prompt shaping as OpenAI path.
+        _stabilize_upstream_prompt_body(body_local)
         # Same long-tool-loop compaction as OpenAI path (sub2api often hits OpenAI
         # chat/completions, but direct Anthropic /v1/messages also benefits).
         _apply_history_compact(body_local)
@@ -3934,7 +4779,10 @@ async def anthropic_messages(
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
     url = f"{UPSTREAM_BASE}/chat/completions"
 
-    compact_hdr = _history_compact_headers(body)
+    compact_hdr = {
+        **_history_compact_headers(body),
+        **_prompt_stabilize_headers(body),
+    }
     if req.stream:
         return StreamingResponse(
             _stream_anthropic_with_failover(
@@ -3975,7 +4823,7 @@ async def anthropic_messages(
         headers = upstream_headers(creds.token, model)
         try:
             content, reasoning, finish, usage, tool_calls = await _collect_completion(
-                url=url, headers=headers, body=body
+                url=url, headers=headers, body=body, account_id=creds.auth_key
             )
             await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
             if conv_fp:
@@ -4041,10 +4889,20 @@ async def anthropic_messages(
             )
             # non-standard debug fields (ignored by strict SDKs that allow extra)
             result["x_grok2api_account"] = creds.email or creds.auth_key
-            result["x_grok2api_affinity"] = bool(prefer_account)
+            _attach_cache_debug_fields(
+                result,
+                ledger_usage if isinstance(ledger_usage, dict) else usage,
+                prefer_account=bool(prefer_account),
+            )
             if conv_fp:
                 result["x_grok2api_conversation_fp"] = conv_fp
-            return result
+            timing.emit(ok=True)
+            return _json_result_with_cache_headers(
+                result,
+                body=body,
+                prefer_account=bool(prefer_account),
+                conv_fp=conv_fp,
+            )
         except httpx.HTTPStatusError as e:
             code = e.response.status_code if e.response is not None else 502
             detail = e.response.text[:800] if e.response is not None else str(e)
@@ -4130,8 +4988,26 @@ async def anthropic_count_tokens(req: anth.AnthropicMessagesRequest):
 
 
 def _responses_affinity(
-    messages: list[dict[str, Any]], req_body: dict[str, Any], request: Request
-) -> tuple[str | None, str | None]:
+    messages: list[dict[str, Any]],
+    req_body: dict[str, Any],
+    request: Request,
+    *,
+    api_key_id: str | None = None,
+) -> tuple[str | None, str | None, str]:
+    """Sticky identity for OpenAI Responses multi-turn.
+
+    Returns ``(session_fp, prefer_account_id, source)``.
+
+    Priority (see conversation_affinity.resolve_responses_affinity):
+      1. explicit conversation_id
+      2. prompt_cache_key (stable across turns — primary cache sticky path)
+      3. previous_response_id chain → linked session_fp + account
+      4. user / message root fingerprint
+
+    Critical: when previous_response_id hits, the returned session_fp is the
+    *linked multi-turn identity*, not a fresh root hash. That keeps Claude Code
+    / sub2api on one account even when system/tools text churns every turn.
+    """
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
     )
@@ -4141,21 +5017,30 @@ def _responses_affinity(
             if meta.get(k):
                 conv_id = str(meta[k])
                 break
-    if not conv_id and req_body.get("previous_response_id"):
-        # Best-effort sticky key when continuing a stored response chain.
-        conv_id = f"prev:{req_body.get('previous_response_id')}"
+    # Top-level Responses conversation object (OpenAI shape).
+    if not conv_id:
+        conv_obj = req_body.get("conversation")
+        if isinstance(conv_obj, str) and conv_obj.strip():
+            conv_id = conv_obj.strip()
+        elif isinstance(conv_obj, dict) and conv_obj.get("id"):
+            conv_id = str(conv_obj.get("id")).strip()
     user = req_body.get("user")
     if not user and isinstance(req_body.get("metadata"), dict):
         user = req_body["metadata"].get("user")
-    pck = conversation_affinity.extract_prompt_cache_key(req_body)
-    fp = conversation_affinity.conversation_fingerprint(
+    pck = conversation_affinity.extract_prompt_cache_key(
+        req_body
+    ) or conversation_affinity.extract_prompt_cache_key_from_headers(request.headers)
+    prev_id = req_body.get("previous_response_id")
+    # Do NOT put previous_response_id into conversation_id — it changes every
+    # turn and would shatter stickiness. Resolve it via response-chain binding.
+    return conversation_affinity.resolve_responses_affinity(
         messages,
         user=str(user) if user else None,
         conversation_id=conv_id,
+        api_key_id=api_key_id,
         prompt_cache_key=pck,
+        previous_response_id=str(prev_id) if prev_id else None,
     )
-    prefer = conversation_affinity.get_affinity(fp) if fp else None
-    return fp, prefer
 
 
 @app.post("/v1/responses")
@@ -4204,8 +5089,12 @@ async def openai_responses(
             err_type="invalid_request_error",
         )
 
-    conv_fp, prefer_account = await asyncio.to_thread(
-        _responses_affinity, body.get("messages") or [], req_body, request
+    conv_fp, prefer_account, affinity_source = await asyncio.to_thread(
+        _responses_affinity,
+        body.get("messages") or [],
+        req_body,
+        request,
+        api_key_id=key_id,
     )
     timing.mark_affinity(prefer_account)
 
@@ -4215,6 +5104,7 @@ async def openai_responses(
             body["stream"] = True
         _sanitize_upstream_body(body, model=model)
         _ensure_stream_include_usage(body)
+        _stabilize_upstream_prompt_body(body)
         _apply_history_compact(body)
         return body
 
@@ -4239,7 +5129,11 @@ async def openai_responses(
 
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
     url = f"{UPSTREAM_BASE}/chat/completions"
-    compact_hdr = _history_compact_headers(body)
+    compact_hdr = {
+        **_history_compact_headers(body),
+        **_prompt_stabilize_headers(body),
+        "X-Grok2API-Affinity-Source": str(affinity_source or "none"),
+    }
     prev_id = req_body.get("previous_response_id")
     metadata = req_body.get("metadata") if isinstance(req_body.get("metadata"), dict) else None
 
@@ -4253,7 +5147,10 @@ async def openai_responses(
             headers = upstream_headers(creds.token, model)
             try:
                 content, reasoning, finish, usage, tool_calls = await _collect_completion(
-                    url=url, headers=headers, body=body
+                    url=url,
+                    headers=headers,
+                    body=body,
+                    account_id=creds.auth_key,
                 )
                 await asyncio.to_thread(
                     account_pool.report_success, creds.auth_key, model=model
@@ -4265,6 +5162,7 @@ async def openai_responses(
                             conv_fp,
                             first_tried,
                             creds.auth_key,
+                            session_fp=conv_fp,
                         )
                         try:
                             from store.metrics import inc
@@ -4274,8 +5172,20 @@ async def openai_responses(
                             pass
                     else:
                         await asyncio.to_thread(
-                            conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                            conversation_affinity.bind_affinity,
+                            conv_fp,
+                            creds.auth_key,
+                            session_fp=conv_fp,
                         )
+                # Pin emitted response_id so next turn's previous_response_id
+                # recovers the same multi-turn session_fp (not just the account).
+                await asyncio.to_thread(
+                    conversation_affinity.bind_response_chain,
+                    response_id,
+                    creds.auth_key,
+                    api_key_id=key_id,
+                    session_fp=conv_fp,
+                )
                 return content, reasoning, finish, usage, tool_calls, creds
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code if e.response is not None else 502
@@ -4369,7 +5279,7 @@ async def openai_responses(
                             account_id=creds.auth_key, attempt=idx
                         )
                         upstream_body = _body_for_upstream(body)
-                        client = await get_http_client()
+                        client = await get_http_client(creds.auth_key)
                         async with client.stream(
                             "POST", url, headers=headers, json=upstream_body
                         ) as resp:
@@ -4409,15 +5319,15 @@ async def openai_responses(
                                         last_error, resp.status_code
                                     )
                                     or last_error,
+                                    model=model,
                                 ):
                                     yield frame
                                 return
 
-                            # TTFT: open response.created ASAP after upstream 200 so sub2api/clients
-                            # see first SSE bytes without waiting on model tokens.
-                            # Still defer success/affinity until real content, and
-                            # convert empty 200 into a clean failed stream (not
-                            # empty completed) so relays don't report malformed 200.
+                            # Defer response.created until real model output so empty HTTP 200 can
+                            # still failover to the next account. Early envelope frames
+                            # used to block retries and made relays report
+                            # "empty or malformed response (HTTP 200)".
                             success_noted = False
                             saw_model_output = False
 
@@ -4441,6 +5351,7 @@ async def openai_responses(
                                                 conv_fp,
                                                 first_tried,
                                                 creds.auth_key,
+                                                session_fp=conv_fp,
                                             )
                                         )
                                     else:
@@ -4449,20 +5360,48 @@ async def openai_responses(
                                                 conversation_affinity.bind_affinity,
                                                 conv_fp,
                                                 creds.auth_key,
+                                                session_fp=conv_fp,
                                             )
                                         )
+                                # Pin emitted response_id for next previous_response_id
+                                # so the linked multi-turn session_fp is recovered.
+                                asyncio.create_task(
+                                    asyncio.to_thread(
+                                        conversation_affinity.bind_response_chain,
+                                        response_id,
+                                        creds.auth_key,
+                                        api_key_id=key_id,
+                                        session_fp=conv_fp,
+                                    )
+                                )
 
-                            for frame in streamer.start():
-                                stream_started = True
-                                yield frame
+                            def _open_responses_stream() -> list[str]:
+                                nonlocal stream_started
+                                frames = streamer.start()
+                                if frames:
+                                    stream_started = True
+                                return frames
 
                             ctype = (resp.headers.get("content-type") or "").lower()
                             if "text/event-stream" in ctype or "stream" in ctype:
+                                client_gone = False
+                                disconnect = _DisconnectProbe()
                                 async for line in _aiter_sse_lines_with_keepalive(resp):
-                                    if await request.is_disconnected():
-                                        return
+                                    # Debounced disconnect probe — single blip
+                                    # under backpressure must not sticky-latch.
+                                    client_gone = await disconnect.check(
+                                        request.is_disconnected
+                                    )
                                     if line is None:
-                                        yield _sse_keepalive()
+                                        # Always poke the client during long thinking /
+                                        # tool-prep gaps. SSE comments do NOT open the
+                                        # Responses envelope, so empty turns remain
+                                        # silent-failoverable for Claude Code / sub2api.
+                                        # Previously we only keepalive'd after
+                                        # stream_started — xhigh TTFT of 6–20s then
+                                        # idle-closed the secondary relay.
+                                        if not client_gone:
+                                            yield _sse_keepalive()
                                         continue
                                     parsed = _parse_sse_line(line)
                                     if parsed is None:
@@ -4477,35 +5416,69 @@ async def openai_responses(
                                     )
                                     if content:
                                         content_parts.append(content)
-                                        saw_model_output = True
-                                        _note_success_once()
-                                        timing.mark_first_token(kind="content")
-                                        for frame in streamer.on_text_delta(content):
-                                            yield frame
+                                        # Only mark progress when client frames leave.
+                                        text_frames = streamer.on_text_delta(content)
+                                        if text_frames:
+                                            saw_model_output = True
+                                            _note_success_once()
+                                            timing.mark_first_token(kind="content")
+                                            # on_text_delta already opens envelope.
+                                            stream_started = True
+                                            if not client_gone:
+                                                for frame in text_frames:
+                                                    yield frame
                                     if reasoning:
+                                        # Keep reasoning internal. Do NOT open the
+                                        # Responses envelope on pure-thinking chunks —
+                                        # if the turn ends with no text/tools, we must
+                                        # still be able to silent-failover (Claude Code
+                                        # reports empty envelope as malformed HTTP 200).
+                                        # Still emit SSE keepalive so long thinking
+                                        # gaps do not idle-close secondary relays.
                                         reasoning_parts.append(reasoning)
-                                        # Keep reasoning internal; Responses clients
-                                        # primarily need output_text / function_call.
+                                        if not client_gone:
+                                            yield _sse_keepalive()
                                     if tool_calls:
                                         _merge_tool_call_delta(
                                             tool_acc, tool_calls
                                         )
-                                        saw_model_output = True
-                                        _note_success_once()
-                                        timing.mark_first_token(kind="tool")
-                                        for frame in streamer.on_tool_delta(
+                                        # on_tool_delta only returns frames when a
+                                        # tool is complete enough to ship; incomplete
+                                        # previews stay held and keep failover open.
+                                        tool_frames = streamer.on_tool_delta(
                                             tool_calls
-                                        ):
-                                            yield frame
+                                        )
+                                        if tool_frames:
+                                            saw_model_output = True
+                                            _note_success_once()
+                                            timing.mark_first_token(kind="tool")
+                                            stream_started = True
+                                            if not client_gone:
+                                                for frame in tool_frames:
+                                                    yield frame
+                                        elif not client_gone:
+                                            # Incomplete tool previews still mean the
+                                            # upstream is alive — poke the client.
+                                            yield _sse_keepalive()
                             else:
                                 # Rare non-SSE upstream response: fall back to one-shot.
                                 raw = await resp.aread()
-                                if not raw or not raw.strip():
-                                    raise RuntimeError(
-                                        "Upstream returned HTTP 200 with empty body "
-                                        "(no model output)"
+                                body_err = _classify_upstream_body_error(
+                                    raw,
+                                    content_type=resp.headers.get("content-type"),
+                                )
+                                if body_err:
+                                    raise RuntimeError(body_err)
+                                try:
+                                    data = json.loads(raw)
+                                except json.JSONDecodeError as e:
+                                    preview = raw[:200].decode(
+                                        "utf-8", errors="replace"
                                     )
-                                data = json.loads(raw)
+                                    raise RuntimeError(
+                                        "Upstream returned HTTP 200 with non-JSON "
+                                        f"body (empty/malformed): {preview!r}"
+                                    ) from e
                                 if isinstance(data.get("usage"), dict):
                                     usage = data["usage"]
                                 choices = data.get("choices") or []
@@ -4515,17 +5488,19 @@ async def openai_responses(
                                     r = msg.get("reasoning_content") or ""
                                     if c:
                                         content_parts.append(c)
-                                        saw_model_output = True
-                                        _note_success_once()
-                                        for frame in streamer.on_text_delta(c):
-                                            yield frame
+                                        text_frames = streamer.on_text_delta(c)
+                                        if text_frames:
+                                            saw_model_output = True
+                                            _note_success_once()
+                                            stream_started = True
+                                            for frame in text_frames:
+                                                yield frame
                                     if r:
+                                        # Do not open envelope on reasoning alone.
                                         reasoning_parts.append(r)
                                     tcs = msg.get("tool_calls")
                                     if isinstance(tcs, list) and tcs:
-                                        saw_model_output = True
-                                        _note_success_once()
-                                        for frame in streamer.on_tool_delta(
+                                        tool_frames = streamer.on_tool_delta(
                                             [
                                                 {
                                                     "index": i,
@@ -4537,18 +5512,47 @@ async def openai_responses(
                                                 for i, tc in enumerate(tcs)
                                                 if isinstance(tc, dict)
                                             ]
-                                        ):
-                                            yield frame
+                                        )
+                                        if tool_frames:
+                                            saw_model_output = True
+                                            _note_success_once()
+                                            stream_started = True
+                                            for frame in tool_frames:
+                                                yield frame
 
                             tool_calls_final = _finalize_tool_calls(tool_acc)
                             joined_content = "".join(content_parts)
                             joined_reasoning = "".join(reasoning_parts)
+
+                            # Pure-reasoning + no tools requested → surface as text so
+                            # clients don't see an empty completed envelope.
                             if (
-                                not saw_model_output
-                                and _is_empty_model_payload(
-                                    content=joined_content,
-                                    reasoning=joined_reasoning,
-                                    tool_calls=tool_calls_final,
+                                not streamer.has_client_payload()
+                                and not (joined_content or "").strip()
+                                and (joined_reasoning or "").strip()
+                                and not tool_calls_final
+                                and not _body_requests_tools(body)
+                            ):
+                                text_frames = streamer.on_text_delta(joined_reasoning)
+                                if text_frames:
+                                    saw_model_output = True
+                                    stream_started = True
+                                    for frame in text_frames:
+                                        yield frame
+
+                            # Empty HTTP 200 / incomplete tool preview only:
+                            # no client-visible text or completed tool frames.
+                            # Keep failover open so relays never see empty envelope.
+                            if (
+                                not streamer.has_client_payload()
+                                and not (joined_content or "").strip()
+                                and (
+                                    not tool_calls_final
+                                    or not any(
+                                        ((tc.get("function") or {}).get("name") or "").strip()
+                                        for tc in (tool_calls_final or [])
+                                        if isinstance(tc, dict)
+                                    )
                                 )
                             ):
                                 empty_err = (
@@ -4571,12 +5575,10 @@ async def openai_responses(
                                     stream=True,
                                 )
                                 last_error = empty_err
-                                # Stream already opened with response.created —
-                                # emit clean failed frames (no empty completed).
-                                for frame in oai_resp.failed_responses_sse(
-                                    response_id=response_id,
-                                    message=empty_err,
-                                ):
+                                # No client bytes yet → silent account failover.
+                                if (not stream_started) and idx < len(chain) - 1:
+                                    continue
+                                for frame in streamer.fail(empty_err):
                                     yield frame
                                 return
 
@@ -4588,6 +5590,56 @@ async def openai_responses(
                                 usage=usage,
                             )
                             _note_success_once()
+                            # Terminal flush ships named tools with parseable JSON
+                            # (mid-stream required-key hold is relaxed only here).
+                            # Truncated non-JSON args still return [] → failover.
+                            complete_frames = streamer.complete(
+                                usage=ledger_usage,
+                                reasoning=joined_reasoning,
+                                force_flush_partial_tools=True,
+                            )
+                            if not complete_frames and not streamer.has_client_payload():
+                                empty_err = (
+                                    "Upstream returned HTTP 200 with empty model output "
+                                    "(no client-visible content/tool_calls)"
+                                )
+                                await asyncio.to_thread(
+                                    account_pool.report_failure,
+                                    creds.auth_key,
+                                    error=empty_err,
+                                    status_code=502,
+                                    model=model,
+                                )
+                                last_error = empty_err
+                                if (not stream_started) and idx < len(chain) - 1:
+                                    continue
+                                for frame in streamer.fail(empty_err):
+                                    yield frame
+                                return
+                            # Soft disconnect still needs a clean terminal (completed/failed + DONE).
+                            # Skipping here is the intermittent hard-cut that makes
+                            # Claude Code / sub2api stop scheduling further turns.
+                            # Prefer complete_frames (success path) over fail when
+                            # we already have client-visible payload.
+                            try:
+                                if client_gone and not stream_started and not complete_frames:
+                                    # Never opened and nothing to ship — stay silent.
+                                    pass
+                                elif complete_frames:
+                                    for frame in complete_frames:
+                                        stream_started = True
+                                        yield frame
+                                elif stream_started and not streamer._closed:
+                                    for f in streamer.fail("client disconnected"):
+                                        yield f
+                            except Exception:
+                                # Socket already gone — best-effort terminal only.
+                                if stream_started and not streamer._closed:
+                                    try:
+                                        for f in streamer.fail("client disconnected"):
+                                            yield f
+                                    except Exception:
+                                        pass
                             _record_usage_safe(
                                 usage=ledger_usage,
                                 ok=True,
@@ -4597,21 +5649,26 @@ async def openai_responses(
                                 protocol="openai_responses",
                                 stream=True,
                             )
-                            for frame in streamer.complete(
-                                usage=ledger_usage,
-                                reasoning=joined_reasoning,
-                            ):
-                                if await request.is_disconnected():
-                                    return
-                                yield frame
                             return
+                    except asyncio.CancelledError:
+                        # Client/proxy cancelled mid-stream. Prefer a clean
+                        # Responses terminal over a silent TCP drop.
+                        if stream_started:
+                            try:
+                                if not streamer._closed:
+                                    for frame in streamer.fail("stream cancelled"):
+                                        yield frame
+                            except Exception:
+                                pass
+                        return
                     except Exception as e:  # noqa: BLE001
                         if stream_started:
-                            for frame in oai_resp.failed_responses_sse(
-                                response_id=response_id,
-                                message=f"Proxy error: {e}",
-                            ):
-                                yield frame
+                            # Continue monotonic sequence_number after live deltas.
+                            try:
+                                for frame in streamer.fail(f"Proxy error: {e}"):
+                                    yield frame
+                            except Exception:
+                                pass
                             return
                         await asyncio.to_thread(
                             account_pool.report_failure,
@@ -4621,12 +5678,20 @@ async def openai_responses(
                             model=model,
                         )
                         last_error = f"Proxy error: {e}"
-                        continue
+                        if idx < len(chain) - 1:
+                            continue
+                        try:
+                            for frame in streamer.fail(last_error):
+                                yield frame
+                        except Exception:
+                            pass
+                        return
                 for frame in oai_resp.failed_responses_sse(
                     response_id=response_id,
                     message=_sanitize_upstream_error_message(last_error or "", 502)
                     or last_error
                     or "All accounts failed",
+                    model=model,
                 ):
                     yield frame
             finally:
@@ -4699,13 +5764,22 @@ async def openai_responses(
         metadata=metadata,
     )
     result["x_grok2api_account"] = creds.email or creds.auth_key
-    result["x_grok2api_affinity"] = bool(prefer_account)
+    _attach_cache_debug_fields(
+        result, ledger_usage, prefer_account=bool(prefer_account)
+    )
     if conv_fp:
         result["x_grok2api_conversation_fp"] = conv_fp
+    result["x_grok2api_affinity_source"] = str(affinity_source or "none")
     hc_stats = body.get("_history_compact") if isinstance(body, dict) else None
     if isinstance(hc_stats, dict):
         result["x_grok2api_history_compact"] = hc_stats
-    return result
+    timing.emit(ok=True)
+    return _json_result_with_cache_headers(
+        result,
+        body=body,
+        prefer_account=bool(prefer_account),
+        conv_fp=conv_fp,
+    )
 
 
 async def _stream_anthropic_with_failover(
@@ -4784,7 +5858,7 @@ async def _stream_anthropic_with_failover_inner(
             message_id=message_id,
             model=model,
             tools_requested=tools_requested,
-            max_tools=history_compact.OUTBOUND_MAX_TOOLS,
+            max_tools=history_compact.resolve_outbound_max_tools("anthropic"),
         )
         finished = False
         stream_started = False
@@ -4793,7 +5867,7 @@ async def _stream_anthropic_with_failover_inner(
         try:
             if timing is not None:
                 timing.mark_upstream_start(account_id=creds.auth_key, attempt=idx)
-            client = await get_http_client()
+            client = await get_http_client(creds.auth_key)
             async with client.stream(
                 "POST", url, headers=headers, json=upstream_body
             ) as resp:
@@ -4826,14 +5900,15 @@ async def _stream_anthropic_with_failover_inner(
                         continue
                     if timing is not None:
                         timing.emit(ok=False, error=last_err)
-                    yield anth.anthropic_stream_error(
+                    for _term_ev in anth.anthropic_stream_terminal_error(
                         last_err, err_type="api_error"
-                    )
+                    ):
+                        yield _term_ev
                     return
 
-                # TTFT: open message_start ASAP after upstream 200 so clients get first
-                # SSE bytes without waiting for model tokens. Still treat empty
-                # 200 as a clean api_error (not empty stop) for compatibility.
+                # Defer message_start until real model output so empty HTTP 200 can still
+                # failover silently. Early envelope open previously blocked retries
+                # and made Claude Code/sub2api report empty/malformed HTTP 200.
                 success_noted = False
                 content_seen = False
                 reasoning_seen = False
@@ -4868,22 +5943,29 @@ async def _stream_anthropic_with_failover_inner(
                                 )
                             )
 
-                # Open with 0 input_tokens for TTFT; finish() attaches real usage later.
-                # Avoid scanning full messages/tools before first SSE byte.
-                for ev in assembler.start(input_tokens=0):
-                    yield ev
-                stream_started = True
+                def _open_anthropic_stream() -> list[str]:
+                    nonlocal stream_started
+                    if stream_started:
+                        return []
+                    # Open with 0 input_tokens; finish() attaches real usage later.
+                    frames = assembler.start(input_tokens=0)
+                    stream_started = True
+                    return frames
 
                 ctype = (resp.headers.get("content-type") or "").lower()
                 client_gone = False
+                disconnect = _DisconnectProbe()
                 if "text/event-stream" in ctype or "stream" in ctype:
                     async for line in _aiter_sse_lines_with_keepalive(resp):
-                        try:
-                            if await client_disconnected():
-                                client_gone = True
-                        except Exception:
-                            client_gone = True
+                        # Debounced disconnect probe — single blip under
+                        # backpressure must not sticky-latch client_gone.
+                        client_gone = await disconnect.check(client_disconnected)
                         if line is None:
+                            # Always ping during long thinking / tool-prep gaps.
+                            # Anthropic pings do NOT open the message envelope, so
+                            # empty turns remain silent-failoverable. Skipping
+                            # pre-start pings used to idle-close sub2api during
+                            # xhigh first-token delays.
                             if not client_gone:
                                 yield anth.anthropic_stream_ping()
                             continue
@@ -4913,40 +5995,53 @@ async def _stream_anthropic_with_failover_inner(
                             usage = parsed["usage"]
                             continue
                         if content or reasoning or tool_calls:
-                            if content:
-                                content_seen = True
-                                saw_model_output = True
-                            if reasoning:
-                                reasoning_seen = True
-                            if tool_calls:
-                                saw_model_output = True
-                            if timing is not None and (
-                                content or tool_calls or reasoning
-                            ):
-                                timing.mark_first_token(
-                                    kind=(
-                                        "content"
-                                        if content
-                                        else ("tool" if tool_calls else "reasoning")
+                            # Soft-disconnect before any client bytes: do not mark
+                            # success / model-output or open the envelope. Keep the
+                            # turn silent so empty-200 failover still works when the
+                            # client briefly flaps (or the probe is late).
+                            if not (client_gone and not stream_started):
+                                if content:
+                                    content_seen = True
+                                    saw_model_output = True
+                                if reasoning:
+                                    reasoning_seen = True
+                                    if str(reasoning).strip():
+                                        saw_model_output = True
+                                if tool_calls:
+                                    saw_model_output = True
+                                if timing is not None and (
+                                    content or tool_calls or reasoning
+                                ):
+                                    timing.mark_first_token(
+                                        kind=(
+                                            "tool"
+                                            if tool_calls
+                                            else (
+                                                "content" if content else "reasoning"
+                                            )
+                                        )
                                     )
-                                )
-                            if content or tool_calls:
                                 _note_success_once()
-                            async for ev in _yield_anthropic_events_serial(
-                                assembler.feed(
-                                    content=content or None,
-                                    reasoning=reasoning or None,
-                                    tool_calls=tool_calls,
-                                ),
-                                client_gone=client_gone,
-                            ):
-                                yield ev
+                                if not stream_started:
+                                    open_frames = _open_anthropic_stream()
+                                    if open_frames and not client_gone:
+                                        for ev in open_frames:
+                                            yield ev
+                                async for ev in _yield_anthropic_events_serial(
+                                    assembler.feed(
+                                        content=content or None,
+                                        reasoning=reasoning or None,
+                                        tool_calls=tool_calls,
+                                    ),
+                                    client_gone=client_gone,
+                                ):
+                                    yield ev
                         if finish:
                             # Capture finish but keep reading — usage often
                             # arrives on a subsequent empty-choices chunk.
                             finished = True
                             held_finish = finish
-                    # Empty 200: stream already opened — emit clean error, not empty stop.
+                    # Empty HTTP 200: no model bytes to client yet → failover.
                     if (
                         not saw_model_output
                         and not assembler._saw_tool
@@ -4973,11 +6068,18 @@ async def _stream_anthropic_with_failover_inner(
                             stream=True,
                         )
                         last_err = empty_err
+                        if (not stream_started) and idx < len(chain) - 1:
+                            continue
                         if timing is not None:
                             timing.emit(ok=False, error=empty_err)
-                        yield anth.anthropic_stream_error(
+                        # Last account (or already opened): clean api_error.
+                        if not stream_started:
+                            for ev in _open_anthropic_stream():
+                                yield ev
+                        for _term_ev in anth.anthropic_stream_terminal_error(
                             empty_err, err_type="api_error"
-                        )
+                        ):
+                            yield _term_ev
                         return
                     # Drain complete: now emit terminal events with best usage
                     fr = held_finish or (
@@ -4991,13 +6093,44 @@ async def _stream_anthropic_with_failover_inner(
                     ):
                         fr = "tool_calls"
                     _note_success_once()
-                    async for ev in _yield_anthropic_events_serial(
-                        assembler.finish(
-                            fr, usage=usage, input_tokens=_ensure_prompt_est()
-                        ),
-                        client_gone=client_gone,
-                    ):
-                        yield ev
+                    # Soft disconnect still needs message_delta/stop after the
+                    # envelope opened. Skipping those frames is the intermittent
+                    # hard-cut that makes Claude Code stop scheduling. If we never
+                    # opened to the client, stay silent (no bare stop frames).
+                    try:
+                        if client_gone and not stream_started:
+                            pass
+                        else:
+                            if not stream_started:
+                                for ev in _open_anthropic_stream():
+                                    yield ev
+                            terminal_events = assembler.finish(
+                                fr, usage=usage, input_tokens=_ensure_prompt_est()
+                            )
+                            if client_gone:
+                                # Skip residual body deltas; always ship stop.
+                                for ev in terminal_events:
+                                    if (
+                                        '"type": "message_delta"' in ev
+                                        or '"type": "message_stop"' in ev
+                                        or '"type": "error"' in ev
+                                    ):
+                                        yield ev
+                            else:
+                                async for ev in _yield_anthropic_events_serial(
+                                    terminal_events,
+                                    client_gone=False,
+                                ):
+                                    yield ev
+                    except Exception:
+                        if stream_started:
+                            try:
+                                for _term_ev in anth.anthropic_stream_terminal_error(
+                                    "client disconnected", err_type="api_error"
+                                ):
+                                    yield _term_ev
+                            except Exception:
+                                pass
                     _record_usage_safe(
                         usage=_usage_from_body_and_output(
                             body,
@@ -5021,10 +6154,46 @@ async def _stream_anthropic_with_failover_inner(
                     return
                 else:
                     raw = await resp.aread()
-                    if not raw or not raw.strip():
+                    body_err = _classify_upstream_body_error(
+                        raw,
+                        content_type=resp.headers.get("content-type"),
+                    )
+                    if body_err:
+                        await asyncio.to_thread(
+                            account_pool.report_failure,
+                            creds.auth_key,
+                            error=body_err,
+                            status_code=502,
+                            model=model,
+                        )
+                        _record_usage_safe(
+                            ok=False,
+                            api_key_id=api_key_id,
+                            account_id=creds.auth_key,
+                            model=model,
+                            protocol="anthropic",
+                            stream=True,
+                        )
+                        last_err = body_err
+                        if (not stream_started) and idx < len(chain) - 1:
+                            continue
+                        if timing is not None:
+                            timing.emit(ok=False, error=body_err)
+                        if not stream_started:
+                            for ev in _open_anthropic_stream():
+                                yield ev
+                        for _term_ev in anth.anthropic_stream_terminal_error(
+                            body_err, err_type="api_error"
+                        ):
+                            yield _term_ev
+                        return
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        text = raw.decode("utf-8", errors="replace")
                         empty_err = (
-                            "Upstream returned HTTP 200 with empty body "
-                            "(no model output)"
+                            "Upstream returned HTTP 200 with non-JSON body "
+                            f"(empty/malformed): {text[:160]!r}"
                         )
                         await asyncio.to_thread(
                             account_pool.report_failure,
@@ -5042,68 +6211,17 @@ async def _stream_anthropic_with_failover_inner(
                             stream=True,
                         )
                         last_err = empty_err
+                        if (not stream_started) and idx < len(chain) - 1:
+                            continue
                         if timing is not None:
                             timing.emit(ok=False, error=empty_err)
-                        yield anth.anthropic_stream_error(
+                        if not stream_started:
+                            for ev in _open_anthropic_stream():
+                                yield ev
+                        for _term_ev in anth.anthropic_stream_terminal_error(
                             empty_err, err_type="api_error"
-                        )
-                        return
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        text = raw.decode("utf-8", errors="replace")
-                        if not text.strip():
-                            empty_err = (
-                                "Upstream returned HTTP 200 with empty body "
-                                "(no model output)"
-                            )
-                            await asyncio.to_thread(
-                                account_pool.report_failure,
-                                creds.auth_key,
-                                error=empty_err,
-                                status_code=502,
-                                model=model,
-                            )
-                            _record_usage_safe(
-                                ok=False,
-                                api_key_id=api_key_id,
-                                account_id=creds.auth_key,
-                                model=model,
-                                protocol="anthropic",
-                                stream=True,
-                            )
-                            last_err = empty_err
-                            if timing is not None:
-                                timing.emit(ok=False, error=empty_err)
-                            yield anth.anthropic_stream_error(
-                                empty_err, err_type="api_error"
-                            )
-                            return
-                        _note_success_once()
-                        async for ev in _yield_anthropic_events_serial(
-                            assembler.feed(content=text)
                         ):
-                            yield ev
-                        async for ev in _yield_anthropic_events_serial(
-                            assembler.finish(
-                                "stop", usage=usage, input_tokens=_ensure_prompt_est()
-                            )
-                        ):
-                            yield ev
-                        _record_usage_safe(
-                            usage={
-                                "prompt_tokens": _ensure_prompt_est(),
-                                "completion_tokens": _estimate_text_tokens(text),
-                                "total_tokens": _ensure_prompt_est()
-                                + _estimate_text_tokens(text),
-                            },
-                            ok=True,
-                            api_key_id=api_key_id,
-                            account_id=creds.auth_key,
-                            model=model,
-                            protocol="anthropic",
-                            stream=True,
-                        )
+                            yield _term_ev
                         return
                     else:
                         if isinstance(data.get("usage"), dict):
@@ -5161,13 +6279,21 @@ async def _stream_anthropic_with_failover_inner(
                                 stream=True,
                             )
                             last_err = empty_err
+                            if (not stream_started) and idx < len(chain) - 1:
+                                continue
                             if timing is not None:
                                 timing.emit(ok=False, error=empty_err)
-                            yield anth.anthropic_stream_error(
+                            if not stream_started:
+                                for ev in _open_anthropic_stream():
+                                    yield ev
+                            for _term_ev in anth.anthropic_stream_terminal_error(
                                 empty_err, err_type="api_error"
-                            )
+                            ):
+                                yield _term_ev
                             return
                         _note_success_once()
+                        for ev in _open_anthropic_stream():
+                            yield ev
                         if content or reasoning or tool_calls:
                             async for ev in _yield_anthropic_events_serial(
                                 assembler.feed(
@@ -5216,6 +6342,9 @@ async def _stream_anthropic_with_failover_inner(
 
             if not finished:
                 _note_success_once()
+                if not stream_started:
+                    for ev in _open_anthropic_stream():
+                        yield ev
                 async for ev in _yield_anthropic_events_serial(
                     assembler.finish(
                         "tool_calls" if assembler._saw_tool else "stop",
@@ -5249,9 +6378,10 @@ async def _stream_anthropic_with_failover_inner(
             # Prefer a clean Anthropic error/stop over a hard cut when stream open.
             if stream_started:
                 try:
-                    yield anth.anthropic_stream_error(
+                    for _term_ev in anth.anthropic_stream_terminal_error(
                         "stream cancelled", err_type="api_error"
-                    )
+                    ):
+                        yield _term_ev
                 except Exception:
                     pass
             return
@@ -5270,20 +6400,23 @@ async def _stream_anthropic_with_failover_inner(
             )
             # Mid-stream failures cannot safely failover for secondary relays
             if stream_started:
-                yield anth.anthropic_stream_error(
+                for _term_ev in anth.anthropic_stream_terminal_error(
                     last_err or "proxy_error", err_type="api_error"
-                )
+                ):
+                    yield _term_ev
                 return
             if idx < len(chain) - 1:
                 continue
-            yield anth.anthropic_stream_error(
+            for _term_ev in anth.anthropic_stream_terminal_error(
                 last_err or "proxy_error", err_type="api_error"
-            )
+            ):
+                yield _term_ev
             return
 
-    yield anth.anthropic_stream_error(
+    for _term_ev in anth.anthropic_stream_terminal_error(
         _sanitize_upstream_error_message(last_err or "", 503) or "All accounts failed", err_type="api_error"
-    )
+    ):
+        yield _term_ev
 
 
 def _static_file_response(rel_path: str):

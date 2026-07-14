@@ -1,10 +1,15 @@
-"""Thread/process-safe auth.json store for multi-account on Linux servers.
+"""Account map store: PostgreSQL primary, auth.json only for file-mode / export.
+
+Production (hybrid) reads and writes go to PostgreSQL. Local auth.json is:
+  - never written as a runtime mirror when PG is enabled
+  - still used as the durable store when STORE_BACKEND=file (escape hatch)
+  - still produced on demand by admin export / migrate_json_to_pg import
 
 Centralizes read/write with:
   - process-local RLock (thread safety)
-  - optional file lock via portalocker-like fcntl / msvcrt (best-effort)
-  - atomic tmp + replace writes
-  - mtime-based in-process cache so 700+ account maps aren't re-parsed constantly
+  - optional file lock via fcntl / msvcrt (file mode only)
+  - atomic tmp + replace writes (file mode only)
+  - mtime-based in-process cache for file-mode large maps
 """
 
 from __future__ import annotations
@@ -264,7 +269,10 @@ def read_auth_entry(
 
 
 def _write_auth_file(data: dict[str, Any], path: Path) -> None:
-    """Atomic write of auth map to local file (backup/mirror/export source)."""
+    """Atomic write of auth map to a local file (file-mode primary or explicit export).
+
+    Not used as a runtime mirror when PostgreSQL is enabled.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     payload = _dump_json(data if isinstance(data, dict) else {})
@@ -289,7 +297,7 @@ def _write_auth_file(data: dict[str, Any], path: Path) -> None:
 
 
 def write_auth_map(data: dict[str, Any], path: Path | None = None) -> None:
-    """Persist auth map. PostgreSQL is primary when enabled; always mirror to file."""
+    """Persist auth map. PostgreSQL is primary when enabled — no auth.json mirror."""
     path = path or AUTH_FILE
     data = data if isinstance(data, dict) else {}
     if path == AUTH_FILE or path.resolve() == AUTH_FILE.resolve():
@@ -297,13 +305,6 @@ def write_auth_map(data: dict[str, Any], path: Path | None = None) -> None:
         if pg is not None:
             pg.write_auth_map(data)
             _invalidate_cache(path)
-            # Keep local file mirror for export/tools; never let mirror failure
-            # roll back the durable PG write.
-            try:
-                with auth_lock():
-                    _write_auth_file(data, path)
-            except Exception:
-                pass
             return
     with auth_lock():
         _write_auth_file(data, path)
@@ -318,12 +319,6 @@ def mutate_auth_map(mutator) -> dict[str, Any]:
     if pg is not None:
         data = pg.mutate_auth_map(mutator)
         _invalidate_cache(AUTH_FILE)
-        # Mirror file after PG mutation so delete/refresh stays consistent.
-        try:
-            with auth_lock():
-                _write_auth_file(data if isinstance(data, dict) else {}, AUTH_FILE)
-        except Exception:
-            pass
         return data
     with auth_lock():
         path = AUTH_FILE
@@ -356,13 +351,6 @@ def upsert_auth_entry(
                 account_id, entry, merge_same_user=merge_same_user
             )
             _invalidate_cache(AUTH_FILE)
-            # Keep file mirror in sync for export/tools after single-account upsert.
-            try:
-                mirrored = pg.read_auth_map()
-                with auth_lock():
-                    _write_auth_file(mirrored, AUTH_FILE)
-            except Exception:
-                pass
             return account_id
         except Exception:
             pass

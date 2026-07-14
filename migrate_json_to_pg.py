@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import data/*.json into PostgreSQL (accounts / keys / settings / pool status).
+"""Import data/*.json into PostgreSQL (accounts / keys / settings / pool / models).
 
 Usage:
   export DATABASE_URL=postgresql://user:pass@127.0.0.1:5432/grok2api
@@ -115,6 +115,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not import keys.json",
     )
+    p.add_argument(
+        "--skip-models",
+        action="store_true",
+        help="Do not import models_cache.json into models table",
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
 
@@ -134,8 +139,9 @@ def main(argv: list[str] | None = None) -> int:
     auth_path = data_dir / "auth.json"
     keys_path = data_dir / "keys.json"
     settings_path = data_dir / "settings.json"
+    models_path = data_dir / "models_cache.json"
 
-    from store import accounts_pg, keys_pg, settings_pg
+    from store import accounts_pg, keys_pg, models_pg, settings_pg
     from store.pg import get_pool, ping
 
     print(f"data_dir={data_dir}")
@@ -285,11 +291,56 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"WARN: pool summary refresh failed: {e}", file=sys.stderr)
 
+    # models catalog (models_cache.json → models table)
+    if not args.skip_models:
+        raw_models = _load_json(models_path)
+        bucket = None
+        meta: dict[str, Any] = {}
+        if isinstance(raw_models, dict):
+            bucket = raw_models.get("models")
+            if isinstance(bucket, dict):
+                meta = {
+                    "fetched_at": raw_models.get("fetched_at"),
+                    "grok_version": raw_models.get("grok_version"),
+                    "auth_method": raw_models.get("auth_method"),
+                    "origin": raw_models.get("origin") or str(models_path),
+                    "source": "migrate_json_to_pg",
+                }
+        if isinstance(bucket, dict) and bucket:
+            print(f"models: {len(bucket)} from {models_path}")
+            if not args.dry_run:
+                n = models_pg.import_bucket(bucket, meta=meta)
+                print(f"models: wrote {n} rows into models table")
+        else:
+            # Ensure synthetic extras exist even without a cache file.
+            if not args.dry_run:
+                try:
+                    from models import ensure_models_catalog_seeded
+
+                    seed = ensure_models_catalog_seeded()
+                    print(
+                        "models: "
+                        + (
+                            f"seeded baseline (count={seed.get('count')})"
+                            if seed.get("seeded")
+                            else f"existing catalog (count={seed.get('count')})"
+                            if seed.get("ok")
+                            else f"skip ({seed.get('error')})"
+                        )
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(f"WARN: models seed failed: {e}", file=sys.stderr)
+            else:
+                print(f"models: no cache at {models_path}")
+    else:
+        print("models: skipped")
+
     if args.dry_run:
         print("dry-run: no writes performed")
     else:
         print(f"done: imported into PostgreSQL at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print("note: account status/cooldown now live in account_pool table (not settings.json)")
+        print("note: model catalog lives in models table (synced from upstream /v1/models)")
     return 0
 
 

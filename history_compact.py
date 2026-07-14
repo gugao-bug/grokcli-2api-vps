@@ -11,6 +11,7 @@ keeping the latest tool rounds intact so the model can still act.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -37,6 +38,10 @@ def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 10_000
 # Opt-in only: long CC/sub2api tool loops can enable this to shrink 400–670KB bodies.
 # Default off — compacting tool results can drop context the model still needs.
 HISTORY_COMPACT_ENABLED = _env_bool("GROK2API_HISTORY_COMPACT", False)
+# When compacting, keep older rewrites deterministic so multi-turn prompt *prefixes*
+# stay byte-stable across turns (helps upstream automatic prefix cache, same idea
+# as superagent-ai/grok-cli replaying a stable message prefix).
+HISTORY_PREFIX_STABLE = _env_bool("GROK2API_HISTORY_PREFIX_STABLE", True)
 # Keep this many most-recent tool rounds fully (assistant tool_calls + tool results).
 HISTORY_KEEP_TOOL_ROUNDS = _env_int("GROK2API_HISTORY_KEEP_TOOL_ROUNDS", 6, minimum=1, maximum=64)
 # Hard cap per single tool / tool_result content (chars). Recent rounds also truncated.
@@ -47,11 +52,21 @@ HISTORY_MAX_TOOL_RESULT_CHARS = _env_int(
 HISTORY_MAX_MESSAGES_CHARS = _env_int(
     "GROK2API_HISTORY_MAX_MESSAGES_CHARS", 280_000, minimum=8_000, maximum=5_000_000
 )
-# Max tools per assistant turn. Default 1: sub2api/Claude Code keep only one
-# active content_block; multi-tool frames still race to "Content block not found"
-# (especially Read) and agent frontends stop scheduling further turns.
-# Set higher only if the client is pure OpenAI; 0 = unlimited (not recommended).
+# Max tools per assistant turn for Claude-compatible paths
+# (/v1/messages, /v1/responses via sub2api). Default 1: sub2api/Claude Code keep
+# only one active content_block; multi-tool frames still race to
+# "Content block not found" (especially Read) and agent frontends stop scheduling.
+# 0 = unlimited.
 OUTBOUND_MAX_TOOLS = _env_int("GROK2API_OUTBOUND_MAX_TOOLS", 1, minimum=0, maximum=64)
+# Pure OpenAI chat/completions path default: unlimited (0). These clients can
+# schedule multiple tool_calls in one turn without content_block races.
+# Override with GROK2API_OUTBOUND_MAX_TOOLS_OPENAI if a secondary OpenAI relay
+# still needs a hard cap.
+OUTBOUND_MAX_TOOLS_OPENAI = _env_int(
+    "GROK2API_OUTBOUND_MAX_TOOLS_OPENAI", 0, minimum=0, maximum=64
+)
+
+
 # Real wall-clock gap between consecutive outbound tool SSE frames (seconds).
 # SSE comment keepalives alone are not enough: sub2api often drains a TCP window
 # of back-to-back tool chunks in one converter tick and still races content_blocks.
@@ -67,7 +82,26 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: floa
 OUTBOUND_TOOL_GAP_SEC = _env_float("GROK2API_OUTBOUND_TOOL_GAP_SEC", 0.08, minimum=0.0, maximum=2.0)
 
 
+def resolve_outbound_max_tools(protocol: str | None = None) -> int:
+    """Pick the per-turn tool cap for a public protocol.
+
+    - anthropic / openai_responses (sub2api): OUTBOUND_MAX_TOOLS (default 1)
+    - openai chat/completions: OUTBOUND_MAX_TOOLS_OPENAI (default 0 = unlimited)
+    """
+    proto = (protocol or "").strip().lower()
+    if proto in ("openai", "chat", "chat_completions", "openai_chat"):
+        return int(OUTBOUND_MAX_TOOLS_OPENAI)
+    # Default conservative: Claude / Responses / unknown secondary relays.
+    return int(OUTBOUND_MAX_TOOLS)
+
+
 _PLACEHOLDER_PREFIX = "[compacted tool result"
+
+
+def _stable_content_digest(text: str) -> str:
+    """Short, stable fingerprint of original content (for prefix-stable placeholders)."""
+    raw = (text or "").encode("utf-8", errors="replace")
+    return hashlib.sha256(raw).hexdigest()[:12]
 
 
 def _content_to_text(content: Any) -> str:
@@ -108,16 +142,33 @@ def _set_text_content(msg: dict[str, Any], text: str) -> None:
 
 
 def _truncate_text(text: str, limit: int, *, label: str = "content") -> str:
+    """Deterministic head truncation (stable for the same text + limit)."""
     if limit <= 0 or len(text) <= limit:
         return text
-    head = max(0, limit - 80)
+    # Keep a fixed trailer budget so the same (text, limit) always yields the same cut.
+    trailer_budget = 96
+    head = max(0, limit - trailer_budget)
     omitted = len(text) - head
-    return f"{text[:head]}\n…[{label} truncated, {omitted} chars omitted]"
+    digest = _stable_content_digest(text)
+    return (
+        f"{text[:head]}\n"
+        f"…[{label} truncated, {omitted} chars omitted, id={digest}]"
+    )
 
 
 def _placeholder(original: str, *, reason: str = "older round") -> str:
-    n = len(original or "")
-    return f"{_PLACEHOLDER_PREFIX}: {reason}; original {n} chars — re-Read if needed]"
+    """Deterministic placeholder: same original → same rewrite across turns."""
+    text = original or ""
+    n = len(text)
+    digest = _stable_content_digest(text)
+    return (
+        f"{_PLACEHOLDER_PREFIX}: {reason}; original {n} chars; id={digest} "
+        f"— re-Read if needed]"
+    )
+
+
+def _already_compacted(text: str) -> bool:
+    return bool(text) and text.startswith(_PLACEHOLDER_PREFIX)
 
 
 def _messages_char_size(messages: list[Any]) -> int:
@@ -173,10 +224,22 @@ def _tool_round_spans(messages: list[dict[str, Any]]) -> list[tuple[int, int]]:
     return spans
 
 
-def _shrink_tool_message(msg: dict[str, Any], *, max_chars: int, force_placeholder: bool) -> bool:
-    """Mutate one tool message. Returns True if content changed."""
+def _shrink_tool_message(
+    msg: dict[str, Any],
+    *,
+    max_chars: int,
+    force_placeholder: bool,
+    prefix_stable: bool = True,
+) -> bool:
+    """Mutate one tool message. Returns True if content changed.
+
+    When ``prefix_stable`` is on, already-compacted placeholders are left alone
+    and rewrites depend only on original text (not turn index / remaining budget).
+    """
     original = _content_to_text(msg.get("content"))
     if not original:
+        return False
+    if prefix_stable and _already_compacted(original):
         return False
     if force_placeholder:
         new = _placeholder(original, reason="older round")
@@ -186,8 +249,9 @@ def _shrink_tool_message(msg: dict[str, Any], *, max_chars: int, force_placehold
         return False
     if len(original) > max_chars:
         new = _truncate_text(original, max_chars, label="tool_result")
-        _set_text_content(msg, new)
-        return True
+        if new != original:
+            _set_text_content(msg, new)
+            return True
     return False
 
 
@@ -217,10 +281,16 @@ def compact_openai_messages(
     keep_tool_rounds: int | None = None,
     max_tool_result_chars: int | None = None,
     max_messages_chars: int | None = None,
+    prefix_stable: bool | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
     """Compact OpenAI-style messages in place-safe copy.
 
     Returns (messages, stats). Stats always present for response headers / logs.
+
+    Prefix stability (default on): older tool results are rewritten with a
+    deterministic placeholder/truncation that depends only on the original
+    content. Once compacted, content is not re-mutated on later turns, so the
+    prompt *prefix* stays byte-stable for automatic upstream cache hits.
     """
     stats: dict[str, Any] = {
         "enabled": False,
@@ -230,6 +300,7 @@ def compact_openai_messages(
         "tool_rounds": 0,
         "compacted_tool_msgs": 0,
         "truncated_tool_msgs": 0,
+        "prefix_stable": False,
     }
     if not isinstance(messages, list) or not messages:
         return messages or [], stats
@@ -244,6 +315,7 @@ def compact_openai_messages(
     budget = (
         HISTORY_MAX_MESSAGES_CHARS if max_messages_chars is None else max_messages_chars
     )
+    stable = HISTORY_PREFIX_STABLE if prefix_stable is None else bool(prefix_stable)
     keep = max(1, int(keep))
     max_tr = max(512, int(max_tr))
     budget = max(8_000, int(budget))
@@ -259,6 +331,7 @@ def compact_openai_messages(
     before = _messages_char_size(out)
     stats["before_chars"] = before
     stats["enabled"] = bool(use)
+    stats["prefix_stable"] = bool(stable)
 
     if not use:
         stats["after_chars"] = before
@@ -287,6 +360,7 @@ def compact_openai_messages(
 
     # Pass 1 (always): placeholder older tool rounds; clamp recent oversized results.
     # Do this even when under budget so long sessions don't slowly accumulate.
+    # Deterministic rewrites keep older prefix stable across successive turns.
     for start, end in spans:
         recent = any(idx in protected for idx in range(start, end))
         for idx in range(start, end):
@@ -294,13 +368,25 @@ def compact_openai_messages(
             if not isinstance(m, dict) or not _is_tool_message(m):
                 continue
             if recent:
-                if _shrink_tool_message(m, max_chars=max_tr, force_placeholder=False):
+                if _shrink_tool_message(
+                    m,
+                    max_chars=max_tr,
+                    force_placeholder=False,
+                    prefix_stable=stable,
+                ):
                     stats["truncated_tool_msgs"] += 1
             else:
-                if _shrink_tool_message(m, max_chars=max_tr, force_placeholder=True):
+                if _shrink_tool_message(
+                    m,
+                    max_chars=max_tr,
+                    force_placeholder=True,
+                    prefix_stable=stable,
+                ):
                     stats["compacted_tool_msgs"] += 1
 
     # Pass 2: if still over budget, hard-clamp recent tool results further.
+    # Only the *recent protected* window may shrink further — older placeholders
+    # stay fixed so the multi-turn prefix does not keep changing.
     after = _messages_char_size(out)
     if after > budget:
         hard = max(1_500, max_tr // 3)
@@ -310,16 +396,19 @@ def compact_openai_messages(
                 if not isinstance(m, dict) or not _is_tool_message(m):
                     continue
                 text = _content_to_text(m.get("content"))
-                if text.startswith(_PLACEHOLDER_PREFIX):
+                if _already_compacted(text):
                     continue
                 if len(text) > hard:
-                    _set_text_content(m, _truncate_text(text, hard, label="tool_result"))
-                    stats["truncated_tool_msgs"] += 1
+                    new = _truncate_text(text, hard, label="tool_result")
+                    if new != text:
+                        _set_text_content(m, new)
+                        stats["truncated_tool_msgs"] += 1
             after = _messages_char_size(out)
             if after <= budget:
                 break
 
     # Pass 3: still over budget — truncate older user/assistant prose (not system).
+    # Skip already-compacted tool msgs; never touch system (cache-critical prefix).
     after = _messages_char_size(out)
     if after > budget:
         soft = max(2_000, max_tr // 2)
@@ -335,19 +424,28 @@ def compact_openai_messages(
                 continue
             if _is_tool_message(m):
                 text = _content_to_text(m.get("content"))
-                if not text.startswith(_PLACEHOLDER_PREFIX):
+                if not _already_compacted(text):
                     _set_text_content(m, _placeholder(text, reason="size budget"))
                     stats["compacted_tool_msgs"] += 1
                     after = _messages_char_size(out)
                 continue
             if role in ("user", "assistant"):
+                # Prefix-stable mode: only shrink very large tails; avoid re-writing
+                # mid-history prose that already sits inside the stable prefix.
+                if stable and idx < max(0, len(out) - keep * 4):
+                    # Leave early non-tool turns alone once they are moderate size.
+                    text = _content_to_text(m.get("content"))
+                    if len(text) <= soft * 2:
+                        continue
                 if _shrink_assistant_oversized_content(m, max_chars=soft):
                     after = _messages_char_size(out)
                 else:
                     text = _content_to_text(m.get("content"))
                     if len(text) > soft:
-                        _set_text_content(m, _truncate_text(text, soft, label=role))
-                        after = _messages_char_size(out)
+                        new = _truncate_text(text, soft, label=role)
+                        if new != text:
+                            _set_text_content(m, new)
+                            after = _messages_char_size(out)
 
     after = _messages_char_size(out)
     stats["after_chars"] = after
@@ -369,21 +467,51 @@ def compact_upstream_body(body: dict[str, Any]) -> dict[str, Any]:
     return stats
 
 
-def cap_outbound_tools(tool_calls: list[Any] | None) -> list[Any] | None:
-    """Optional safety valve: limit tools emitted in one assistant response."""
-    if not tool_calls or OUTBOUND_MAX_TOOLS <= 0:
+def cap_outbound_tools(
+    tool_calls: list[Any] | None,
+    *,
+    max_tools: int | None = None,
+    protocol: str | None = None,
+) -> list[Any] | None:
+    """Optional safety valve: limit tools emitted in one assistant response.
+
+    ``max_tools`` wins when provided; else protocol-aware default; else global
+    OUTBOUND_MAX_TOOLS. 0 / negative → unlimited.
+    """
+    if not tool_calls:
         return tool_calls
-    if len(tool_calls) <= OUTBOUND_MAX_TOOLS:
+    limit = (
+        int(max_tools)
+        if max_tools is not None
+        else resolve_outbound_max_tools(protocol)
+        if protocol is not None
+        else int(OUTBOUND_MAX_TOOLS)
+    )
+    if limit <= 0:
         return tool_calls
-    return tool_calls[:OUTBOUND_MAX_TOOLS]
+    if len(tool_calls) <= limit:
+        return tool_calls
+    return tool_calls[:limit]
 
 
-def remaining_outbound_tool_budget(already_emitted: int) -> int | None:
+def remaining_outbound_tool_budget(
+    already_emitted: int,
+    *,
+    max_tools: int | None = None,
+    protocol: str | None = None,
+) -> int | None:
     """How many more tools may be shipped this turn.
 
-    None means unlimited (OUTBOUND_MAX_TOOLS <= 0). 0 means stop emitting.
+    None means unlimited (max_tools <= 0). 0 means stop emitting.
     """
-    if OUTBOUND_MAX_TOOLS <= 0:
+    limit = (
+        int(max_tools)
+        if max_tools is not None
+        else resolve_outbound_max_tools(protocol)
+        if protocol is not None
+        else int(OUTBOUND_MAX_TOOLS)
+    )
+    if limit <= 0:
         return None
-    left = OUTBOUND_MAX_TOOLS - max(0, int(already_emitted or 0))
+    left = limit - max(0, int(already_emitted or 0))
     return max(0, left)

@@ -5,6 +5,8 @@ services:
     image: redis:7-alpine
     container_name: grokcli-2api-redis
     command: ["redis-server", "--save", "", "--appendonly", "no"]
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -16,6 +18,8 @@ services:
     image: postgres:16-alpine
     container_name: grokcli-2api-postgres
     environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      PGTZ: "${TZ:-Asia/Shanghai}"
       POSTGRES_USER: grok2api
       POSTGRES_PASSWORD: grok2api
       POSTGRES_DB: grok2api
@@ -47,6 +51,7 @@ services:
     security_opt:
       - seccomp:unconfined
     environment:
+      TZ: "${TZ:-Asia/Shanghai}"
       GROK2API_HOST: "0.0.0.0"
       GROK2API_PORT: "3000"
       GROK2API_OPEN_BROWSER: "0"

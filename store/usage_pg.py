@@ -458,6 +458,123 @@ def record_event(
         return None
 
 
+def cache_aggregate(*, days: int | None = 7) -> dict[str, Any]:
+    """Aggregate prompt-cache stats from usage_events.
+
+    Returns token-level and request-level hit metrics for:
+      - today (UTC)
+      - last N days window (when days is set)
+      - lifetime (all rows)
+
+    Source of truth is per-request ``usage_events`` (has cache_read_tokens).
+    Daily rollups intentionally do not store cache fields.
+    """
+    empty_bucket = {
+        "prompt_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "ok_requests": 0,
+        "cache_hit_requests": 0,
+        "token_hit_ratio": None,
+        "request_hit_ratio": None,
+    }
+    out: dict[str, Any] = {
+        "ok": True,
+        "source": "none",
+        "today": dict(empty_bucket),
+        "window": dict(empty_bucket),
+        "lifetime": dict(empty_bucket),
+        "days": max(1, min(90, int(days or 7))),
+    }
+    if not enabled():
+        return out
+
+    def _bucket_from_row(row: Any) -> dict[str, Any]:
+        if not row:
+            return dict(empty_bucket)
+        pt = max(0, int(row[0] or 0))
+        cr = max(0, int(row[1] or 0))
+        cc = max(0, int(row[2] or 0))
+        ok_req = max(0, int(row[3] or 0))
+        hit_req = max(0, int(row[4] or 0))
+        token_ratio = round(100.0 * cr / pt, 2) if pt > 0 else None
+        req_ratio = round(100.0 * hit_req / ok_req, 2) if ok_req > 0 else None
+        return {
+            "prompt_tokens": pt,
+            "cache_read_tokens": cr,
+            "cache_creation_tokens": cc,
+            "ok_requests": ok_req,
+            "cache_hit_requests": hit_req,
+            "token_hit_ratio": token_ratio,
+            "request_hit_ratio": req_ratio,
+        }
+
+    n = max(1, min(90, int(days or 7)))
+    try:
+        with connection() as conn:
+            with conn.cursor() as cur:
+                # lifetime
+                cur.execute(
+                    """
+                    SELECT
+                      COALESCE(SUM(prompt_tokens), 0),
+                      COALESCE(SUM(cache_read_tokens), 0),
+                      COALESCE(SUM(cache_creation_tokens), 0),
+                      COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
+                      COALESCE(COUNT(*) FILTER (
+                        WHERE ok IS TRUE AND cache_read_tokens > 0
+                      ), 0)
+                    FROM usage_events
+                    """
+                )
+                out["lifetime"] = _bucket_from_row(cur.fetchone())
+
+                # today UTC
+                cur.execute(
+                    """
+                    SELECT
+                      COALESCE(SUM(prompt_tokens), 0),
+                      COALESCE(SUM(cache_read_tokens), 0),
+                      COALESCE(SUM(cache_creation_tokens), 0),
+                      COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
+                      COALESCE(COUNT(*) FILTER (
+                        WHERE ok IS TRUE AND cache_read_tokens > 0
+                      ), 0)
+                    FROM usage_events
+                    WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+                          AT TIME ZONE 'UTC'
+                    """
+                )
+                out["today"] = _bucket_from_row(cur.fetchone())
+
+                # window: last N UTC days inclusive of today
+                cur.execute(
+                    """
+                    SELECT
+                      COALESCE(SUM(prompt_tokens), 0),
+                      COALESCE(SUM(cache_read_tokens), 0),
+                      COALESCE(SUM(cache_creation_tokens), 0),
+                      COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
+                      COALESCE(COUNT(*) FILTER (
+                        WHERE ok IS TRUE AND cache_read_tokens > 0
+                      ), 0)
+                    FROM usage_events
+                    WHERE created_at >= (
+                      date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                      - (%s::int - 1) * INTERVAL '1 day'
+                    )
+                    """,
+                    (n,),
+                )
+                out["window"] = _bucket_from_row(cur.fetchone())
+        out["source"] = "postgres"
+        out["days"] = n
+        return out
+    except Exception:
+        out["ok"] = False
+        return out
+
+
 def list_events(
     *,
     q: str = "",

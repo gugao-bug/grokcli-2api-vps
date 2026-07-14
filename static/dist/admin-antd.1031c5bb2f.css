@@ -200,6 +200,15 @@ input:focus, select:focus, textarea:focus, .g2a-input:focus {
 textarea { min-height: 90px; resize: vertical; font-family: var(--mono); font-size: 12.5px; }
 .g2a-form-row, .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
 .g2a-form-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.g2a-form-grid .g2a-field-span2 { grid-column: 1 / -1; }
+.g2a-form-grid textarea#reg-proxy {
+  width: 100%;
+  min-height: 72px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
+}
 .g2a-field { flex: 1 1 180px; min-width: 0; }
 .g2a-field-grow { flex: 1 1 100%; }
 .g2a-field-action { flex: 0 0 auto; }

@@ -85,6 +85,8 @@ _PG_SCALAR_KEYS = (
     "max_failover_attempts",
     # Protocol registration (MoeMail / YesCaptcha / proxy) — admin UI config
     "registration_config",
+    # Outbound proxy pool for account-pool traffic (chat / probe / refresh)
+    "outbound_proxy_config",
 )
 
 
@@ -218,25 +220,12 @@ def _write_disk(data: dict[str, Any]) -> None:
                         pg.set_setting("sessions", data["sessions"])
                 except Exception:
                     pg.set_setting("sessions", data.get("sessions") or {})
-            # Mirror non-pool settings only (no account_pool JSON storage).
-            try:
-                _ensure()
-                tmp = SETTINGS_FILE.with_suffix(".tmp")
-                mirror = {
-                    k: v
-                    for k, v in data.items()
-                    if k not in ("account_pool",)
-                }
-                tmp.write_text(
-                    json.dumps(mirror, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-                tmp.replace(SETTINGS_FILE)
-                _mem_mtime_ns = _file_mtime_ns()
-            except Exception:
-                pass
+            # PostgreSQL is the durable store — do not mirror settings.json at runtime.
+            # settings.json remains only for STORE_BACKEND=file and migrate import.
             return
         except Exception:
             pass
+    # File-mode fallback (explicit STORE_BACKEND=file / PG unavailable).
     _ensure()
     tmp = SETTINGS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1098,7 +1087,7 @@ def _set_setting_value(key: str, value: Any) -> Any:
         try:
             pg.set_setting(key, value)
         except Exception:
-            # Still update local mem + mirror file so this worker keeps working.
+            # Still update local mem so this worker keeps working.
             pass
     with _lock:
         data = _load()
@@ -1376,6 +1365,11 @@ def apply_runtime_settings_to_modules() -> None:
         apply_registration_config_to_runtime()
     except Exception:
         pass
+    # Outbound proxy pool (account chat / probe / refresh).
+    try:
+        apply_outbound_proxy_config_to_runtime()
+    except Exception:
+        pass
 
 
 # ── protocol registration config (MoeMail / YesCaptcha / proxy) ────────────
@@ -1407,6 +1401,7 @@ _REG_CONFIG_KEYS = (
     "proxy",
     "proxy_username",
     "proxy_password",
+    "proxy_strategy",
     "count",
     "concurrency",
     "stagger_ms",
@@ -1535,12 +1530,27 @@ def _env_registration_defaults() -> dict[str, Any]:
         if cf_base:
             # Dedicated CF host only — never overwrite MoeMail base_url.
             out["cfmail_base_url"] = cf_base
-        if XAI_PROXY:
+        # Prefer multi-line pool env when present; keep single-proxy fallback.
+        pool_env = (
+            os.environ.get("GROK2API_XAI_PROXY_POOL")
+            or os.environ.get("GROK2API_PROXY_POOL")
+            or ""
+        ).strip()
+        if pool_env:
+            out["proxy"] = pool_env
+        elif XAI_PROXY:
             out["proxy"] = str(XAI_PROXY)
         if XAI_PROXY_USERNAME:
             out["proxy_username"] = str(XAI_PROXY_USERNAME)
         if XAI_PROXY_PASSWORD:
             out["proxy_password"] = str(XAI_PROXY_PASSWORD)
+        strat = (
+            os.environ.get("GROK2API_XAI_PROXY_STRATEGY")
+            or os.environ.get("GROK2API_PROXY_STRATEGY")
+            or ""
+        ).strip().lower()
+        if strat:
+            out["proxy_strategy"] = strat
         mail_provider = (
             os.environ.get("GROK2API_MAIL_PROVIDER")
             or os.environ.get("MAIL_PROVIDER")
@@ -1763,9 +1773,20 @@ def _normalize_registration_config(
     else:
         cfg["local_solver_url"] = ""
     cfg["yescaptcha_key"] = _pick_str("yescaptcha_key", 512)
-    cfg["proxy"] = _pick_str("proxy", 512)
+    # Proxy field accepts a single URL or a multi-line proxy pool.
+    # Cap is large enough for residential lists (one proxy per line).
+    cfg["proxy"] = _pick_str("proxy", 64_000)
     cfg["proxy_username"] = _pick_str("proxy_username", 256)
     cfg["proxy_password"] = _pick_str("proxy_password", 512)
+    strat_raw = _pick_str("proxy_strategy", 32).lower().replace("-", "_")
+    if strat_raw in {"rr", "round", "roundrobin", "round_robin"}:
+        cfg["proxy_strategy"] = "round_robin"
+    elif strat_raw in {"rand", "random"}:
+        cfg["proxy_strategy"] = "random"
+    elif strat_raw in {"sticky", "first", "fixed"}:
+        cfg["proxy_strategy"] = "sticky"
+    else:
+        cfg["proxy_strategy"] = "round_robin"
 
     # expiry_ms — MoeMail official presets; YYDS temp mail is ~24h (map to 1 day).
     expiry_raw = src.get("expiry_ms", env.get("expiry_ms", 3600000))
@@ -1858,6 +1879,24 @@ def get_registration_config(*, include_secrets: bool = True) -> dict[str, Any]:
     }
     public["captcha_provider"] = provider
     public["mail_provider"] = mail_provider
+    public["proxy_strategy"] = str(cfg.get("proxy_strategy") or "round_robin")
+    try:
+        from proxy_pool import pool_summary
+
+        public["proxy_pool"] = pool_summary(
+            str(cfg.get("proxy") or ""),
+            username=str(cfg.get("proxy_username") or "") or None,
+            password=str(cfg.get("proxy_password") or "") or None,
+            strategy=str(cfg.get("proxy_strategy") or "round_robin"),
+            fallback_env=False,
+        )
+    except Exception:
+        public["proxy_pool"] = {
+            "enabled": bool(cfg.get("proxy")),
+            "count": 1 if cfg.get("proxy") else 0,
+            "strategy": str(cfg.get("proxy_strategy") or "round_robin"),
+            "preview": [],
+        }
     # Fixed hosts — UI should not require URL for yyds/gptmail.
     public["mail_base_url_fixed"] = mail_provider in {"yyds", "gptmail"}
     return public
@@ -2053,6 +2092,11 @@ def set_registration_config(
         "base_url",
         "moemail_base_url",
         "cfmail_base_url",
+        # Proxy pool: empty means "cleared" so env cannot revive a deleted list.
+        "proxy",
+        "proxy_username",
+        "proxy_password",
+        "proxy_strategy",
     }
     cleaned = {
         k: v
@@ -2119,6 +2163,9 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     proxy = str(cfg.get("proxy") or "").strip()
     proxy_user = str(cfg.get("proxy_username") or "").strip()
     proxy_pass = str(cfg.get("proxy_password") or "").strip()
+    proxy_strategy = str(cfg.get("proxy_strategy") or "round_robin").strip().lower()
+    if proxy_strategy not in {"round_robin", "random", "sticky"}:
+        proxy_strategy = "round_robin"
 
     _set_env("GROK2API_MAIL_PROVIDER", mail_provider)
     _set_env("MAIL_PROVIDER", mail_provider)
@@ -2198,12 +2245,29 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
         else:
             os.environ.pop("GROK2API_YESCAPTCHA_KEY", None)
             os.environ.pop("YESCAPTCHA_API_KEY", None)
+    # Mirror full multi-line text into both pool + legacy single-proxy envs.
+    # Adapter / SSO helpers still read GROK2API_XAI_PROXY for first-proxy fallback.
     if proxy:
-        _set_env("GROK2API_XAI_PROXY", proxy)
+        _set_env("GROK2API_XAI_PROXY_POOL", proxy)
+        # Keep first usable line in the classic single-proxy env for older paths.
+        first_line = next(
+            (ln.strip() for ln in proxy.replace("\r", "\n").split("\n") if ln.strip() and not ln.strip().startswith("#")),
+            proxy,
+        )
+        _set_env("GROK2API_XAI_PROXY", first_line)
+    else:
+        os.environ.pop("GROK2API_XAI_PROXY_POOL", None)
+        os.environ.pop("GROK2API_XAI_PROXY", None)
     if proxy_user:
         _set_env("GROK2API_XAI_PROXY_USERNAME", proxy_user)
+    else:
+        os.environ.pop("GROK2API_XAI_PROXY_USERNAME", None)
     if proxy_pass:
         _set_env("GROK2API_XAI_PROXY_PASSWORD", proxy_pass)
+    else:
+        os.environ.pop("GROK2API_XAI_PROXY_PASSWORD", None)
+    _set_env("GROK2API_XAI_PROXY_STRATEGY", proxy_strategy)
+    _set_env("GROK2API_PROXY_STRATEGY", proxy_strategy)
     if cfg.get("expiry_ms") is not None:
         try:
             _set_env("GROK2API_MOEMAIL_EXPIRY_MS", str(int(cfg["expiry_ms"])))
@@ -2225,12 +2289,25 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
                 _cfg.MOEMAIL_EXPIRY_MS = int(cfg["expiry_ms"])
             except (TypeError, ValueError):
                 pass
+        if hasattr(_cfg, "XAI_PROXY_POOL"):
+            _cfg.XAI_PROXY_POOL = proxy
+        if hasattr(_cfg, "XAI_PROXY_STRATEGY"):
+            _cfg.XAI_PROXY_STRATEGY = proxy_strategy
+        # Classic single-proxy field: first non-empty line for back-compat.
         if proxy:
-            _cfg.XAI_PROXY = proxy
-        if proxy_user:
-            _cfg.XAI_PROXY_USERNAME = proxy_user
-        if proxy_pass:
-            _cfg.XAI_PROXY_PASSWORD = proxy_pass
+            first_line = next(
+                (
+                    ln.strip()
+                    for ln in proxy.replace("\r", "\n").split("\n")
+                    if ln.strip() and not ln.strip().startswith("#")
+                ),
+                proxy,
+            )
+            _cfg.XAI_PROXY = first_line
+        else:
+            _cfg.XAI_PROXY = ""
+        _cfg.XAI_PROXY_USERNAME = proxy_user
+        _cfg.XAI_PROXY_PASSWORD = proxy_pass
     except Exception:
         pass
 
@@ -2414,6 +2491,223 @@ def set_pool_policy(patch: dict[str, Any]) -> dict[str, Any]:
     return get_pool_policy()
 
 
+# ── outbound proxy pool (account chat / probe / refresh) ───────────────────
+
+
+def _env_outbound_proxy_defaults() -> dict[str, Any]:
+    out: dict[str, Any] = {"enabled": True}
+    try:
+        from config import (
+            XAI_PROXY,
+            XAI_PROXY_PASSWORD,
+            XAI_PROXY_POOL,
+            XAI_PROXY_STRATEGY,
+            XAI_PROXY_USERNAME,
+        )
+    except Exception:
+        XAI_PROXY = ""
+        XAI_PROXY_POOL = ""
+        XAI_PROXY_USERNAME = ""
+        XAI_PROXY_PASSWORD = ""
+        XAI_PROXY_STRATEGY = "round_robin"
+    pool = str(XAI_PROXY_POOL or XAI_PROXY or "").strip()
+    if pool:
+        out["proxy"] = pool
+    if XAI_PROXY_USERNAME:
+        out["proxy_username"] = str(XAI_PROXY_USERNAME)
+    if XAI_PROXY_PASSWORD:
+        out["proxy_password"] = str(XAI_PROXY_PASSWORD)
+    if XAI_PROXY_STRATEGY:
+        out["proxy_strategy"] = str(XAI_PROXY_STRATEGY)
+    return out
+
+
+def _normalize_outbound_proxy_config(
+    raw: dict[str, Any] | None,
+    *,
+    merge_env: bool = True,
+) -> dict[str, Any]:
+    src = raw if isinstance(raw, dict) else {}
+    env = _env_outbound_proxy_defaults() if merge_env else {}
+
+    def _pick(key: str, max_len: int = 512) -> str:
+        if key in src and src.get(key) is not None:
+            return str(src.get(key) or "").strip()[:max_len]
+        return str(env.get(key, "") or "").strip()[:max_len]
+
+    cfg: dict[str, Any] = {}
+    if "enabled" in src and src.get("enabled") is not None:
+        cfg["enabled"] = bool(src.get("enabled"))
+    else:
+        cfg["enabled"] = bool(env.get("enabled", True))
+    # Multi-line pool text — same cap as registration.
+    cfg["proxy"] = _pick("proxy", 64_000)
+    cfg["proxy_username"] = _pick("proxy_username", 256)
+    cfg["proxy_password"] = _pick("proxy_password", 512)
+    strat = _pick("proxy_strategy", 32).lower().replace("-", "_")
+    if strat in {"rr", "round", "roundrobin", "round_robin"}:
+        cfg["proxy_strategy"] = "round_robin"
+    elif strat in {"rand", "random"}:
+        cfg["proxy_strategy"] = "random"
+    elif strat in {"sticky", "first", "fixed"}:
+        cfg["proxy_strategy"] = "sticky"
+    else:
+        cfg["proxy_strategy"] = "round_robin"
+    return cfg
+
+
+def get_outbound_proxy_config(*, include_secrets: bool = True) -> dict[str, Any]:
+    stored = _get_setting_value("outbound_proxy_config", None)
+    if not isinstance(stored, dict):
+        stored = {}
+    cfg = _normalize_outbound_proxy_config(stored, merge_env=True)
+    if include_secrets:
+        return cfg
+    public = dict(cfg)
+    if public.get("proxy_password"):
+        public["proxy_password"] = _mask_secret(str(public.get("proxy_password") or ""))
+    return public
+
+
+def set_outbound_proxy_config(
+    patch: dict[str, Any] | None,
+    *,
+    replace: bool = False,
+) -> dict[str, Any]:
+    """Persist outbound proxy pool config and apply to runtime."""
+    if patch is not None and not isinstance(patch, dict):
+        raise ValueError("outbound_proxy_config must be an object")
+    patch = dict(patch or {})
+    current = _get_setting_value("outbound_proxy_config", None)
+    if not isinstance(current, dict):
+        current = {}
+    base: dict[str, Any] = {} if replace else dict(current)
+
+    if "enabled" in patch and patch.get("enabled") is not None:
+        base["enabled"] = bool(patch.get("enabled"))
+
+    for key in ("proxy", "proxy_username", "proxy_password", "proxy_strategy"):
+        if key not in patch:
+            continue
+        val = patch.get(key)
+        if val is None:
+            continue
+        s = str(val).strip() if not isinstance(val, bool) else str(val)
+        if key == "proxy_password" and _is_masked_secret(s):
+            if current.get("proxy_password"):
+                base["proxy_password"] = current["proxy_password"]
+            continue
+        # Empty string is intentional clear for proxy text / auth.
+        base[key] = s
+
+    cfg = _normalize_outbound_proxy_config(base, merge_env=False)
+    cleaned = {
+        "enabled": bool(cfg.get("enabled", True)),
+        "proxy": str(cfg.get("proxy") or "").strip(),
+        "proxy_username": str(cfg.get("proxy_username") or "").strip(),
+        "proxy_password": str(cfg.get("proxy_password") or "").strip(),
+        "proxy_strategy": str(cfg.get("proxy_strategy") or "round_robin"),
+    }
+    _set_setting_value("outbound_proxy_config", cleaned)
+    apply_outbound_proxy_config_to_runtime(cleaned)
+    return dict(cleaned)
+
+
+def apply_outbound_proxy_config_to_runtime(
+    cfg: dict[str, Any] | None = None,
+) -> None:
+    """Push outbound proxy pool into env/config and drop cached HTTP clients."""
+    if cfg is None:
+        cfg = get_outbound_proxy_config(include_secrets=True)
+    if not isinstance(cfg, dict):
+        return
+
+    def _set_env(name: str, value: str) -> None:
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
+
+    enabled = bool(cfg.get("enabled", True))
+    proxy = str(cfg.get("proxy") or "").strip() if enabled else ""
+    proxy_user = str(cfg.get("proxy_username") or "").strip()
+    proxy_pass = str(cfg.get("proxy_password") or "").strip()
+    strategy = str(cfg.get("proxy_strategy") or "round_robin").strip().lower()
+    if strategy not in {"round_robin", "random", "sticky"}:
+        strategy = "round_robin"
+
+    if proxy:
+        _set_env("GROK2API_XAI_PROXY_POOL", proxy)
+        first_line = next(
+            (
+                ln.strip()
+                for ln in proxy.replace("\r", "\n").split("\n")
+                if ln.strip() and not ln.strip().startswith("#")
+            ),
+            proxy,
+        )
+        _set_env("GROK2API_XAI_PROXY", first_line)
+    else:
+        # Only clear pool envs when admin explicitly disabled/cleared outbound
+        # config — do not wipe registration proxy envs if they share the same keys
+        # and outbound was never set. When enabled=False with empty text we still
+        # clear so direct-connect is honoured.
+        if "proxy" in cfg or not enabled:
+            os.environ.pop("GROK2API_XAI_PROXY_POOL", None)
+            # Keep single-proxy env if registration still owns it.
+            try:
+                reg = get_registration_config(include_secrets=True) or {}
+                reg_proxy = str(reg.get("proxy") or "").strip()
+            except Exception:
+                reg_proxy = ""
+            if not reg_proxy:
+                os.environ.pop("GROK2API_XAI_PROXY", None)
+    if proxy_user:
+        _set_env("GROK2API_XAI_PROXY_USERNAME", proxy_user)
+    if proxy_pass:
+        _set_env("GROK2API_XAI_PROXY_PASSWORD", proxy_pass)
+    _set_env("GROK2API_XAI_PROXY_STRATEGY", strategy)
+    _set_env("GROK2API_PROXY_STRATEGY", strategy)
+
+    try:
+        import config as _cfg
+
+        if hasattr(_cfg, "XAI_PROXY_POOL"):
+            _cfg.XAI_PROXY_POOL = proxy
+        if hasattr(_cfg, "XAI_PROXY_STRATEGY"):
+            _cfg.XAI_PROXY_STRATEGY = strategy
+        if proxy:
+            first_line = next(
+                (
+                    ln.strip()
+                    for ln in proxy.replace("\r", "\n").split("\n")
+                    if ln.strip() and not ln.strip().startswith("#")
+                ),
+                proxy,
+            )
+            _cfg.XAI_PROXY = first_line
+        _cfg.XAI_PROXY_USERNAME = proxy_user
+        _cfg.XAI_PROXY_PASSWORD = proxy_pass
+    except Exception:
+        pass
+
+    # Drop process-local HTTP clients so next request rebuilds with new proxy.
+    try:
+        import app as _app
+
+        if hasattr(_app, "invalidate_http_clients"):
+            _app.invalidate_http_clients()
+    except Exception:
+        pass
+    try:
+        import model_health as _mh
+
+        if hasattr(_mh, "invalidate_probe_http_client"):
+            _mh.invalidate_probe_http_client()
+    except Exception:
+        pass
+
+
 def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
     """Apply a partial settings patch from admin UI. Returns effective public settings."""
     if not isinstance(patch, dict):
@@ -2466,6 +2760,30 @@ def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
         set_pool_policy(pool_patch)
     if "registration_config" in patch and patch["registration_config"] is not None:
         set_registration_config(patch["registration_config"])
+    # Outbound proxy pool (flat fields or nested outbound_proxy / outbound_proxy_config)
+    ob_patch: dict[str, Any] = {}
+    for nested_key in ("outbound_proxy_config", "outbound_proxy"):
+        nested_ob = patch.get(nested_key)
+        if isinstance(nested_ob, dict):
+            ob_patch.update(nested_ob)
+    for k in (
+        "outbound_proxy_enabled",
+        "outbound_proxy",
+        "outbound_proxy_username",
+        "outbound_proxy_password",
+        "outbound_proxy_strategy",
+    ):
+        if k in patch and patch[k] is not None:
+            short = k.replace("outbound_", "", 1) if k.startswith("outbound_") else k
+            if short == "proxy_enabled":
+                ob_patch["enabled"] = patch[k]
+            else:
+                ob_patch[short] = patch[k]
+    # Also accept non-prefixed keys when nested under clear names from UI collect.
+    if "proxy_pool" in patch and patch["proxy_pool"] is not None:
+        ob_patch["proxy"] = patch["proxy_pool"]
+    if ob_patch:
+        set_outbound_proxy_config(ob_patch, replace=False)
     return get_public_settings()
 
 
@@ -2473,6 +2791,19 @@ def get_public_settings() -> dict[str, Any]:
     data = _load()
     # Secrets stay full for admin session API (admin-auth only); UI masks display.
     reg = get_registration_config(include_secrets=True)
+    outbound = get_outbound_proxy_config(include_secrets=True)
+    try:
+        from proxy_pool import outbound_pool_public_summary
+
+        outbound_summary = outbound_pool_public_summary()
+    except Exception:
+        outbound_summary = {
+            "enabled": bool(outbound.get("enabled") and outbound.get("proxy")),
+            "count": 0,
+            "strategy": outbound.get("proxy_strategy") or "round_robin",
+            "source": "settings" if outbound.get("proxy") else "none",
+            "preview": [],
+        }
     return {
         "account_mode": get_account_mode(),
         "account_modes": list(VALID_ACCOUNT_MODES),
@@ -2497,5 +2828,7 @@ def get_public_settings() -> dict[str, Any]:
         "default_model": get_default_model_setting(),
         "pool_policy": get_pool_policy(),
         "registration_config": reg,
+        "outbound_proxy_config": outbound,
+        "outbound_proxy_pool": outbound_summary,
         "updated_at": data.get("updated_at"),
     }

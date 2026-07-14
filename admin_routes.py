@@ -144,6 +144,20 @@ class RuntimeSettingsBody(BaseModel):
     probe_kick_cooldown_sec: float | None = Field(default=None, ge=30, le=7200)
     max_failover_attempts: int | None = Field(default=None, ge=1, le=64)
     pool_policy: dict[str, Any] | None = None
+    # Outbound proxy pool for account-pool traffic (chat / probe / refresh)
+    outbound_proxy_enabled: bool | None = None
+    outbound_proxy: str | None = Field(
+        default=None,
+        max_length=64_000,
+        description="Multi-line proxy pool for account egress",
+    )
+    outbound_proxy_username: str | None = Field(default=None, max_length=256)
+    outbound_proxy_password: str | None = Field(default=None, max_length=512)
+    outbound_proxy_strategy: str | None = Field(
+        default=None,
+        pattern="^(round_robin|random|sticky|rr|rand|first|fixed)?$",
+    )
+    outbound_proxy_config: dict[str, Any] | None = None
 
 
 class KickAccountBody(BaseModel):
@@ -230,9 +244,18 @@ class EmailRegistrationBody(BaseModel):
         max_length=256,
         description="MoeMail only; YYDS/GPTMail use fixed hosts",
     )
-    proxy: str | None = Field(default=None, max_length=512)
+    proxy: str | None = Field(
+        default=None,
+        max_length=64_000,
+        description="Single proxy URL or multi-line proxy pool (one per line)",
+    )
     proxy_username: str | None = Field(default=None, max_length=256)
     proxy_password: str | None = Field(default=None, max_length=512)
+    proxy_strategy: str | None = Field(
+        default=None,
+        pattern="^(round_robin|random|sticky|rr|rand|first|fixed)?$",
+        description="Proxy pool strategy: round_robin | random | sticky",
+    )
     # Multi-thread batch registration
     count: int | None = Field(
         default=1,
@@ -260,9 +283,24 @@ class EmailRegistrationBody(BaseModel):
 
 
 class EmailRegistrationProxyTestBody(BaseModel):
-    proxy: str | None = Field(default=None, max_length=512)
+    proxy: str | None = Field(
+        default=None,
+        max_length=64_000,
+        description="Single proxy or multi-line pool; tests first (or all when test_all)",
+    )
     proxy_username: str | None = Field(default=None, max_length=256)
     proxy_password: str | None = Field(default=None, max_length=512)
+    proxy_strategy: str | None = Field(default=None, max_length=32)
+    test_all: bool | None = Field(
+        default=False,
+        description="When true, smoke-test every proxy in the pool (capped)",
+    )
+    max_test: int | None = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Max proxies to test when test_all is true",
+    )
 
 
 class RegistrationConfigBody(BaseModel):
@@ -307,9 +345,18 @@ class RegistrationConfigBody(BaseModel):
         description="Local Turnstile Solver base URL",
     )
     yescaptcha_key: str | None = Field(default=None, max_length=512)
-    proxy: str | None = Field(default=None, max_length=512)
+    proxy: str | None = Field(
+        default=None,
+        max_length=64_000,
+        description="Single proxy URL or multi-line proxy pool",
+    )
     proxy_username: str | None = Field(default=None, max_length=256)
     proxy_password: str | None = Field(default=None, max_length=512)
+    proxy_strategy: str | None = Field(
+        default=None,
+        pattern="^(round_robin|random|sticky|rr|rand|first|fixed)?$",
+        description="Proxy pool strategy: round_robin | random | sticky",
+    )
     count: int | None = Field(default=None, ge=1, le=10000)
     concurrency: int | None = Field(default=None, ge=1, le=10)
     stagger_ms: int | None = Field(default=None, ge=0, le=10000)
@@ -1708,6 +1755,7 @@ def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfig
         "proxy": body.proxy,
         "proxy_username": getattr(body, "proxy_username", None),
         "proxy_password": getattr(body, "proxy_password", None),
+        "proxy_strategy": getattr(body, "proxy_strategy", None),
         "count": getattr(body, "count", None),
         "concurrency": getattr(body, "concurrency", None),
         "stagger_ms": getattr(body, "stagger_ms", None),
@@ -1793,6 +1841,9 @@ async def start_email_registration(
     try:
         result = adapter.start_registration(
             proxy=resolved.get("proxy") or None,
+            proxy_username=resolved.get("proxy_username") or None,
+            proxy_password=resolved.get("proxy_password") or None,
+            proxy_strategy=resolved.get("proxy_strategy") or None,
             moemail_api_key=resolved.get("api_key") or None,
             moemail_base_url=resolved.get("base_url") or None,
             prefix=resolved.get("prefix") or None,
@@ -1808,7 +1859,7 @@ async def start_email_registration(
             probe_delay_sec=resolved.get("probe_delay_sec"),
         )
     except TypeError:
-        # Older adapter without batch / mail_provider kwargs.
+        # Older adapter without batch / mail_provider / pool kwargs.
         try:
             result = adapter.start_registration(
                 proxy=resolved.get("proxy") or None,
@@ -1837,19 +1888,73 @@ async def test_email_registration_proxy(
 ):
     require_admin(request, x_admin_token)
     from moemail import test_xai_proxy
+    from proxy_pool import parse_proxy_pool, pool_summary, pick_proxy
 
     resolved = resolve_registration_inputs(
         {
             "proxy": body.proxy,
             "proxy_username": body.proxy_username,
             "proxy_password": body.proxy_password,
+            "proxy_strategy": body.proxy_strategy,
         }
     )
-    return test_xai_proxy(
-        proxy=resolved.get("proxy") or None,
-        proxy_username=resolved.get("proxy_username") or None,
-        proxy_password=resolved.get("proxy_password") or None,
+    proxy_text = resolved.get("proxy") or None
+    proxy_user = resolved.get("proxy_username") or None
+    proxy_pass = resolved.get("proxy_password") or None
+    strategy = resolved.get("proxy_strategy") or "round_robin"
+    pool = parse_proxy_pool(
+        proxy_text,
+        username=proxy_user,
+        password=proxy_pass,
+        fallback_env=True,
     )
+    summary = pool_summary(
+        proxy_text,
+        username=proxy_user,
+        password=proxy_pass,
+        strategy=strategy,
+        fallback_env=True,
+    )
+    if not pool:
+        # Fall back to classic single-proxy smoke test (may be empty / direct).
+        result = test_xai_proxy(
+            proxy=proxy_text,
+            proxy_username=proxy_user,
+            proxy_password=proxy_pass,
+        )
+        result["proxy_pool"] = summary
+        return result
+
+    test_all = bool(body.test_all)
+    max_test = int(body.max_test or 5)
+    max_test = max(1, min(20, max_test))
+    if test_all and len(pool) > 1:
+        targets = pool[:max_test]
+        results = []
+        ok_n = 0
+        for url in targets:
+            r = test_xai_proxy(proxy=url)
+            r["proxy"] = url
+            results.append(r)
+            if r.get("ok"):
+                ok_n += 1
+        return {
+            "ok": ok_n > 0,
+            "proxy_enabled": True,
+            "proxy_pool": summary,
+            "tested": len(results),
+            "ok_count": ok_n,
+            "fail_count": len(results) - ok_n,
+            "results": results,
+            "message": f"tested {len(results)}/{len(pool)} proxies, ok={ok_n}",
+        }
+
+    # Default: test one proxy picked by strategy (first for sticky/rr).
+    chosen = pick_proxy(pool, strategy=strategy, index=0) or pool[0]
+    result = test_xai_proxy(proxy=chosen)
+    result["proxy_pool"] = summary
+    result["proxy_tested"] = chosen
+    return result
 
 
 @router.post("/register-email/test-proxy")
@@ -2865,7 +2970,7 @@ async def delete_accounts_batch(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Delete multiple accounts from durable store (PostgreSQL + file mirror)."""
+    """Delete multiple accounts from durable store (PostgreSQL, or auth.json in file mode)."""
     require_admin(request, x_admin_token)
     ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
     if not ids:
@@ -3025,8 +3130,15 @@ async def accounts_probe_batch(
     model = resolve_model(body.model) if body.model else None
 
     def _run() -> list[dict[str, Any]]:
+        # Parallel across accounts (same cap as background probes) — sequential
+        # loop over hundreds of ids freezes admin requests when many models exist.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from config import MODEL_PROBE_WORKERS
+
         out: list[dict[str, Any]] = []
-        for aid in ids:
+        workers = max(1, min(int(MODEL_PROBE_WORKERS or 4), len(ids), 16))
+
+        def _one(aid: str) -> dict[str, Any]:
             try:
                 r = model_health.probe_single_account(
                     aid,
@@ -3034,10 +3146,32 @@ async def accounts_probe_batch(
                     auto_disable=body.auto_disable,
                     source="manual_batch",
                 )
-                out.append(_probe_result_with_pool(aid, r if isinstance(r, dict) else {"ok": False}))
+                return _probe_result_with_pool(
+                    aid, r if isinstance(r, dict) else {"ok": False}
+                )
             except Exception as e:  # noqa: BLE001
-                out.append(
-                    _probe_result_with_pool(
+                return _probe_result_with_pool(
+                    aid,
+                    {
+                        "ok": False,
+                        "account_id": aid,
+                        "error": str(e)[:300],
+                        "result": {"available": False, "error": str(e)[:300]},
+                    },
+                )
+
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="probe-batch-"
+        ) as ex:
+            futs = {ex.submit(_one, aid): aid for aid in ids}
+            # Preserve input order for stable UI.
+            by_id: dict[str, dict[str, Any]] = {}
+            for fut in as_completed(futs):
+                aid = futs[fut]
+                try:
+                    by_id[aid] = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    by_id[aid] = _probe_result_with_pool(
                         aid,
                         {
                             "ok": False,
@@ -3046,7 +3180,7 @@ async def accounts_probe_batch(
                             "result": {"available": False, "error": str(e)[:300]},
                         },
                     )
-                )
+            out = [by_id[aid] for aid in ids if aid in by_id]
         return out
 
     results = await asyncio.to_thread(_run)
@@ -3429,10 +3563,20 @@ async def admin_models(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
+    meta: dict = {}
+    try:
+        from store import models_pg
+
+        if models_pg.enabled():
+            meta = models_pg.get_meta() or {}
+    except Exception:
+        pass
     return {
         "object": "list",
         "data": load_models_from_cache(),
         "default_model": DEFAULT_MODEL,
+        "storage": "postgres",
+        "meta": meta,
     }
 
 
@@ -3441,7 +3585,7 @@ async def models_sync(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Fetch model list from cli-chat-proxy and update models_cache.json."""
+    """Fetch model list from cli-chat-proxy and store in PostgreSQL."""
     require_admin(request, x_admin_token)
     result = sync_models_from_upstream()
     if not result.get("ok"):
@@ -3451,7 +3595,11 @@ async def models_sync(
         action="models.sync",
         summary=f"同步上游模型 {result.get('count') or ''}",
         target_type="models",
-        detail={"count": result.get("count")},
+        detail={
+            "count": result.get("count"),
+            "storage": "postgres",
+            "pg_count": result.get("pg_count"),
+        },
     )
     return result
 

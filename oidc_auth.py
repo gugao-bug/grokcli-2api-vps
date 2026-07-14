@@ -317,18 +317,19 @@ class RefreshRevokedError(ValueError):
 
 
 def _hard_delete_invalid_refresh_enabled() -> bool:
-    """Whether permanent RT failures may hard-delete accounts.
+    """Whether permanent RT failures hard-delete accounts from the pool.
 
-    Default OFF: soft-disable (keep credentials, remove from rotation) so a
-    misclassified transient error cannot wipe usable accounts.
-    Opt-in hard delete: GROK2API_DELETE_INVALID_REFRESH=1
+    Default ON: permanently invalid refresh tokens (invalid_grant / revoked)
+    are deleted from auth store + pool state so they never re-enter rotation.
+    Soft-disable only when explicitly opted out:
+      GROK2API_DELETE_INVALID_REFRESH=0
     """
     raw = (
         os.environ.get("GROK2API_DELETE_INVALID_REFRESH")
         or os.environ.get("DELETE_INVALID_REFRESH")
-        or "0"
+        or "1"
     ).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _is_permanent_refresh_failure(status_code: int, body: str) -> bool:
@@ -336,7 +337,7 @@ def _is_permanent_refresh_failure(status_code: int, body: str) -> bool:
 
     Intentionally narrow: bare ``revoked`` / ``invalid_token`` / ``token is
     invalid`` used to match transient proxy / upstream noise and caused usable
-    accounts to be purged. Prefer soft-disable even when True.
+    accounts to be purged. Only exact permanent grant failures qualify.
     """
     text = (body or "").lower()
     if status_code not in (400, 401):
@@ -363,15 +364,15 @@ def mark_refresh_invalid(
     reason: str = "refresh_token permanently invalid",
     hard_delete: bool | None = None,
 ) -> dict[str, Any]:
-    """Mark one account's refresh token invalid and take it out of rotation.
+    """Remove a permanently invalid refresh account from the pool.
 
-    Default: soft action only
+    Default (GROK2API_DELETE_INVALID_REFRESH=1): hard-delete credentials +
+    pool state so the account never re-enters rotation.
+
+    Soft path only when hard_delete=False or env is explicitly 0:
       - set ``refresh_invalid`` / reason on the durable account entry
       - disable pool rotation (enabled=False)
-      - do NOT delete credentials
-
-    Hard delete only when ``hard_delete=True`` or env
-    ``GROK2API_DELETE_INVALID_REFRESH=1``.
+      - keep credentials
     """
     aid = str(account_id or "").strip()
     if not aid:
@@ -522,7 +523,7 @@ def delete_account_for_refresh_failure(
     *,
     reason: str = "refresh_token permanently invalid",
 ) -> dict[str, Any]:
-    """Back-compat wrapper: soft-disable by default (see mark_refresh_invalid)."""
+    """Back-compat wrapper: hard-delete by default (see mark_refresh_invalid)."""
     return mark_refresh_invalid(account_id, reason=reason)
 
 
@@ -560,8 +561,35 @@ def refresh_access_token(
     if client is not None:
         resp = client.post(OIDC_TOKEN_URL, data=form, headers=headers)
     else:
-        with httpx.Client(timeout=30.0) as c:
+        # Prefer outbound proxy pool when configured (single-account refresh path).
+        proxy_url = None
+        try:
+            from proxy_pool import pick_proxy_for_account
+
+            aid = (
+                str(entry.get("id") or entry.get("user_id") or entry.get("email") or "")
+                .strip()
+            )
+            proxy_url = pick_proxy_for_account(aid or None)
+        except Exception:
+            proxy_url = None
+        if proxy_url:
+            try:
+                c = httpx.Client(timeout=30.0, proxy=proxy_url)
+            except TypeError:
+                c = httpx.Client(
+                    timeout=30.0,
+                    proxies={"http://": proxy_url, "https://": proxy_url},
+                )
+        else:
+            c = httpx.Client(timeout=30.0)
+        try:
             resp = c.post(OIDC_TOKEN_URL, data=form, headers=headers)
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
     if resp.status_code >= 400:
         body = resp.text[:400]
         if _is_permanent_refresh_failure(resp.status_code, body):
@@ -1234,11 +1262,34 @@ def refresh_all_accounts(
     _clients: list[httpx.Client] = []
     _clients_lock = threading.Lock()
 
-    def _thread_client() -> httpx.Client:
-        client = getattr(_tls, "client", None)
+    def _thread_client(account_id: str | None = None) -> httpx.Client:
+        # Cache one client per thread+proxy so refresh batches reuse TLS.
+        proxy_url = None
+        if account_id:
+            try:
+                from proxy_pool import pick_proxy_for_account
+
+                proxy_url = pick_proxy_for_account(account_id)
+            except Exception:
+                proxy_url = None
+        cache_key = proxy_url or ""
+        bucket = getattr(_tls, "clients", None)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            _tls.clients = bucket
+        client = bucket.get(cache_key)
         if client is None or client.is_closed:
-            client = httpx.Client(timeout=30.0)
-            _tls.client = client
+            if proxy_url:
+                try:
+                    client = httpx.Client(timeout=30.0, proxy=proxy_url)
+                except TypeError:
+                    client = httpx.Client(
+                        timeout=30.0,
+                        proxies={"http://": proxy_url, "https://": proxy_url},
+                    )
+            else:
+                client = httpx.Client(timeout=30.0)
+            bucket[cache_key] = client
             with _clients_lock:
                 _clients.append(client)
         return client
@@ -1247,7 +1298,7 @@ def refresh_all_accounts(
         aid, entry = item
         try:
             r = refresh_and_persist(
-                aid, entry, client=_thread_client(), persist=False
+                aid, entry, client=_thread_client(aid), persist=False
             )
             # Successful refresh clears any previous invalid mark.
             new_entry = dict(r["entry"])
@@ -1269,12 +1320,12 @@ def refresh_all_accounts(
             reason = str(e)[:300]
             with updates_lock:
                 invalid_marks[aid] = reason
-            # Soft-disable immediately so dead RTs leave rotation; hard delete
-            # only when GROK2API_DELETE_INVALID_REFRESH=1.
-            action = "disabled"
+            # Permanent RT failure: hard-delete by default so dead accounts leave
+            # the pool immediately (opt out with DELETE_INVALID_REFRESH=0).
+            action = "deleted"
             try:
                 res = mark_refresh_invalid(aid, reason=reason)
-                action = str((res or {}).get("action") or "disabled")
+                action = str((res or {}).get("action") or "deleted")
             except Exception:
                 pass
             return {
@@ -1312,9 +1363,9 @@ def refresh_all_accounts(
                         pass
                 _clients.clear()
 
-    # Permanent refresh failures: default soft-disable (mark invalid + leave pool).
-    # Hard-delete only when GROK2API_DELETE_INVALID_REFRESH=1 (handled inside
-    # mark_refresh_invalid already). Temporary failures keep the account.
+    # Permanent refresh failures: default hard-delete (handled inside
+    # mark_refresh_invalid). Soft-disable only when env explicitly opts out.
+    # Temporary failures keep the account.
     disabled_ids: list[str] = []
     deleted_ids: list[str] = []
     deleted_reasons: dict[str, str] = {}
@@ -1474,15 +1525,15 @@ def purge_refresh_invalid_accounts(
     dry_run: bool = False,
     hard_delete: bool | None = None,
 ) -> dict[str, Any]:
-    """Handle permanently unusable accounts.
+    """Remove permanently unusable accounts from the pool.
 
-    Default (safe): soft-disable only
+    Default (GROK2API_DELETE_INVALID_REFRESH=1): hard-delete credentials +
+    pool state.
+
+    Soft-disable only when ``hard_delete=False`` or env is explicitly 0:
       - mark ``refresh_invalid``
       - remove from rotation (enabled=False)
-      - keep credentials so a false positive can be re-enabled / re-imported
-
-    Hard delete only when ``hard_delete=True`` or
-    ``GROK2API_DELETE_INVALID_REFRESH=1``.
+      - keep credentials
 
     Targets:
       1. accounts already marked ``refresh_invalid``

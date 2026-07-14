@@ -275,6 +275,7 @@ def maybe_disable_from_quota_result(result: dict[str, Any]) -> dict[str, Any]:
     """If quota result says exhausted, disable the account and annotate result.
 
     Always persist last_quota into DB/settings for admin UI cache.
+    When billing shows healthy again, re-enable accounts previously removed for quota.
     """
     if not result.get("ok"):
         # still cache failed query timestamp/error so UI can show "上次失败"
@@ -293,6 +294,7 @@ def maybe_disable_from_quota_result(result: dict[str, Any]) -> dict[str, Any]:
             account_id, reason=reason, source="billing"
         )
         result["auto_disabled"] = True
+        result["auto_reenabled"] = False
         result["disabled_record"] = disabled
         result["display"] = dict(result.get("display") or {})
         result["display"]["summary"] = f"额度耗尽 · 已移出轮询（{reason}）"
@@ -305,12 +307,39 @@ def maybe_disable_from_quota_result(result: dict[str, Any]) -> dict[str, Any]:
                 pass
     else:
         result["auto_disabled"] = False
+        reenabled = None
         if account_id:
             try:
                 import account_pool
+
+                # save_quota_snapshot re-enters pool when healthy; also explicit path
+                # for older rows that only had enabled=false without last_quota.
                 account_pool.save_quota_snapshot(account_id, result)
+                meta = None
+                try:
+                    meta = account_pool.get_account_pool_meta(account_id)
+                except Exception:
+                    meta = None
+                if isinstance(meta, dict) and (
+                    meta.get("disabled_for_quota") or meta.get("enabled") is False
+                ):
+                    src = str(meta.get("quota_source") or meta.get("disabled_source") or "")
+                    if src in ("", "billing", "upstream_error", "model_health", "quota") or bool(
+                        meta.get("disabled_for_quota")
+                    ):
+                        reenabled = account_pool.reenable_for_quota(
+                            account_id,
+                            reason="billing 查询显示额度可用",
+                            source="billing",
+                        )
             except Exception:
-                pass
+                reenabled = None
+        result["auto_reenabled"] = bool(reenabled)
+        result["reenabled_record"] = reenabled
+        if reenabled:
+            result["display"] = dict(result.get("display") or {})
+            summary = (result.get("display") or {}).get("summary") or "额度可用"
+            result["display"]["summary"] = f"{summary} · 已重新入池"
     return result
 
 

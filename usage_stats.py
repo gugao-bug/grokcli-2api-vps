@@ -475,6 +475,24 @@ def summary(*, days: int = 7) -> dict[str, Any]:
             for r in series_rows:
                 window = _sum_stats(window, r)
 
+    cache = {
+        "ok": False,
+        "source": "none",
+        "today": {},
+        "window": {},
+        "lifetime": {},
+        "days": n,
+    }
+    try:
+        from store import usage_pg
+
+        if usage_pg.enabled():
+            cache = usage_pg.cache_aggregate(days=n)
+            if cache.get("source") == "postgres" and "postgres" not in source_bits:
+                source_bits.append("postgres")
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "days": n,
@@ -487,6 +505,7 @@ def summary(*, days: int = 7) -> dict[str, Any]:
             **life,
             "success_rate": _rate(life["success"], life["requests"]),
         },
+        "cache": cache,
         "series": series_rows,
         "source": "+".join(source_bits) if source_bits else "none",
         "light": light_snapshot(force=True),

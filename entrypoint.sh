@@ -44,9 +44,10 @@ start_inline_solver() {
   echo "${solver_pid}" > /app/turnstile-solver/logs/turnstile_solver.pid
   echo "[entrypoint] inline solver pid=${solver_pid}"
 
-  # Wait until solver HTTP is ready (best-effort)
-  for i in $(seq 1 60); do
-    if curl -fsS -m 1 "http://127.0.0.1:${solver_port}/" >/dev/null 2>&1; then
+  # Wait until solver HTTP is ready (best-effort, but fail loud if still down)
+  for i in $(seq 1 90); do
+    if curl -fsS -m 1 "http://127.0.0.1:${solver_port}/health" >/dev/null 2>&1 \
+      || curl -fsS -m 1 "http://127.0.0.1:${solver_port}/" >/dev/null 2>&1; then
       echo "[entrypoint] inline solver ready"
       return 0
     fi
@@ -56,7 +57,7 @@ start_inline_solver() {
     fi
     sleep 1
   done
-  echo "[entrypoint] WARN: inline solver not ready after 60s; continuing app startup" >&2
+  echo "[entrypoint] WARN: inline solver not ready after 90s; registration will wait/block until it is" >&2
 }
 
 cleanup() {

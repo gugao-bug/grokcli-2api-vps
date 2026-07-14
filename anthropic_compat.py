@@ -42,11 +42,16 @@ class AnthropicMessagesRequest(BaseModel):
     container: Any | None = None
 
 
-# Anthropic thinking budget → OpenAI reasoning_effort mapping
+# Anthropic thinking budget → OpenAI reasoning_effort mapping.
+# Include xhigh so Claude Code / Anthropic clients can request the top Grok tier
+# (cli-chat-proxy / grok-4.5 accept reasoning_effort=xhigh).
 _THINKING_EFFORT_MAP: dict[str, str] = {
     "low": "low",
     "medium": "medium",
     "high": "high",
+    "xhigh": "xhigh",
+    "extra_high": "xhigh",
+    "extrahigh": "xhigh",
 }
 
 
@@ -57,19 +62,27 @@ def _anthropic_thinking_to_reasoning_effort(thinking: Any) -> str | None:
     Accepts:
       - {"type": "enabled", "budget_tokens": 1024}
       - {"type": "enabled", "budget_tokens": 32000}
+      - {"type": "enabled", "budget_tokens": 64000}  → xhigh
       - true / "enabled"
-      - "low" / "medium" / "high"
+      - "low" / "medium" / "high" / "xhigh"
     """
     if thinking is None:
         return None
     if isinstance(thinking, str):
-        return _THINKING_EFFORT_MAP.get(thinking.lower())
+        return _THINKING_EFFORT_MAP.get(thinking.lower().strip())
     if isinstance(thinking, bool):
         return "medium" if thinking else None
     if isinstance(thinking, dict):
         ttype = (thinking.get("type") or "").lower()
         if ttype not in ("enabled", ""):
             return None
+        # Prefer explicit effort string when clients send it alongside budget.
+        for key in ("effort", "reasoning_effort"):
+            raw = thinking.get(key)
+            if isinstance(raw, str) and raw.strip():
+                mapped = _THINKING_EFFORT_MAP.get(raw.lower().strip())
+                if mapped:
+                    return mapped
         budget = thinking.get("budget_tokens")
         try:
             budget = int(budget) if budget is not None else None
@@ -81,7 +94,11 @@ def _anthropic_thinking_to_reasoning_effort(thinking: Any) -> str | None:
             return "low"
         if budget <= 16000:
             return "medium"
-        return "high"
+        # High-but-not-extreme budgets stay on high; very large budgets map to
+        # xhigh so "max thinking" clients actually get the top tier.
+        if budget <= 48000:
+            return "high"
+        return "xhigh"
     return None
 
 
@@ -366,6 +383,11 @@ def _ensure_tool_parameters(params: Any) -> dict[str, Any]:
 
 
 def anthropic_tools_to_openai(tools: list[Any] | None) -> list[dict[str, Any]] | None:
+    """Convert Anthropic tools → OpenAI function tools (stable name order).
+
+    Sorting by tool name keeps multi-turn prompt prefixes byte-stable when
+    clients reshuffle tools arrays — important for automatic upstream cache.
+    """
     if not tools:
         return None
     out: list[dict[str, Any]] = []
@@ -405,7 +427,18 @@ def anthropic_tools_to_openai(tools: list[Any] | None) -> list[dict[str, Any]] |
         )
         fn["parameters"] = _ensure_tool_parameters(schema)
         out.append({"type": "function", "function": fn})
-    return out or None
+    if not out:
+        return None
+    out.sort(
+        key=lambda t: str(
+            ((t.get("function") or {}) if isinstance(t.get("function"), dict) else {}).get(
+                "name"
+            )
+            or t.get("name")
+            or ""
+        ).lower()
+    )
+    return out
 
 
 def anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
@@ -506,6 +539,62 @@ def map_finish_to_stop_reason(
     return "end_turn"
 
 
+def _tool_arg_value_score(value: Any) -> tuple[int, int, int, int]:
+    """Higher score = richer / more usable tool-argument payload."""
+    if isinstance(value, dict):
+        non_empty = 0
+        for v in value.values():
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            if isinstance(v, (list, dict)) and not v:
+                continue
+            non_empty += 1
+        try:
+            nbytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        except (TypeError, ValueError):
+            nbytes = len(str(value))
+        return (3, len(value), non_empty, nbytes)
+    if isinstance(value, list):
+        try:
+            nbytes = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        except (TypeError, ValueError):
+            nbytes = len(str(value))
+        return (2, len(value), 0, nbytes)
+    if value is None:
+        return (0, 0, 0, 0)
+    text = str(value)
+    return (1, 1 if text.strip() else 0, 0, len(text))
+
+
+def _merge_tool_arg_dicts(values: list[Any]) -> dict[str, Any] | None:
+    """Deep-ish merge of successive dict rewrites (later non-empty wins)."""
+    dicts = [v for v in values if isinstance(v, dict)]
+    if not dicts:
+        return None
+    merged: dict[str, Any] = {}
+    for d in dicts:
+        for k, v in d.items():
+            if k not in merged:
+                merged[k] = v
+                continue
+            old = merged.get(k)
+            if old in (None, "", [], {}):
+                merged[k] = v
+            elif isinstance(old, dict) and isinstance(v, dict):
+                tmp = dict(old)
+                tmp.update(v)
+                merged[k] = tmp
+            elif isinstance(old, list) and isinstance(v, list) and len(v) >= len(old):
+                merged[k] = v
+            else:
+                # Prefer later value when both set (correction / expansion).
+                if v not in (None, "", [], {}):
+                    merged[k] = v
+    return merged
+
+
 def sanitize_tool_arguments_json(raw: Any) -> str:
     """
     Normalize tool argument text and recover doubled JSON blobs.
@@ -513,6 +602,11 @@ def sanitize_tool_arguments_json(raw: Any) -> str:
     Secondary relays may emit one chunk containing two complete objects:
     `{"file_path":"a"}{"file_path":"a"}`. Clients that concatenate stream
     pieces then fail required-field validation (Claude Code Read/Write).
+
+    Grok also commonly rewrites tool args mid-stream in a *single* SSE line:
+      {"file_path":"/x"}{"file_path":"/x","old_string":"a","new_string":"b"}
+    Always keeping the first object drops Update/Edit payloads and makes the
+    client call Update with only a path (looks like a random/wrong edit).
 
     When the input is already a single valid JSON value, return the original
     string unchanged so true OpenAI delta suffixes keep prefix continuity.
@@ -572,7 +666,37 @@ def sanitize_tool_arguments_json(raw: Any) -> str:
     first_text = src[: ends[0]].strip()
     if all(v == first for v in values[1:]):
         return first_text
-    return first_text
+
+    # Prefer a deep-merge of successive dict rewrites when that yields a richer
+    # payload (Update: partial file_path object + full edit object in one chunk).
+    merged = _merge_tool_arg_dicts(values)
+    candidates: list[tuple[tuple[int, int, int, int], str]] = []
+    if merged is not None:
+        try:
+            merged_text = json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+            candidates.append((_tool_arg_value_score(merged), merged_text))
+        except (TypeError, ValueError):
+            pass
+    for i, v in enumerate(values):
+        try:
+            if i == 0:
+                text = first_text
+            else:
+                # Reconstruct each complete value slice when possible.
+                start = ends[i - 1]
+                while start < ends[i] and src[start].isspace():
+                    start += 1
+                text = src[start : ends[i]].strip()
+                # Fallback serialize if slice is awkward.
+                if not text:
+                    text = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+            candidates.append((_tool_arg_value_score(v), text))
+        except (TypeError, ValueError):
+            continue
+    if not candidates:
+        return first_text
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def is_complete_json_text(s: str) -> bool:
@@ -609,6 +733,34 @@ _TOOL_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "web_search": ("query",),
 }
 
+# Alternate key spellings some models / relays emit. Normalized to the Claude
+# Code schema before readiness checks and outbound emission.
+_TOOL_ARG_KEY_ALIASES: dict[str, str] = {
+    "path": "file_path",
+    "filepath": "file_path",
+    "file": "file_path",
+    "filename": "file_path",
+    "oldstring": "old_string",
+    "oldstr": "old_string",
+    "oldtext": "old_string",
+    "old": "old_string",
+    "newstring": "new_string",
+    "newstr": "new_string",
+    "newtext": "new_string",
+    "new": "new_string",
+    "notebookpath": "notebook_path",
+    "notebook": "notebook_path",
+    "cmd": "command",
+    "shell_command": "command",
+    "q": "query",
+    "search": "query",
+    "search_query": "query",
+    "uri": "url",
+    "href": "url",
+    "regex": "pattern",
+    "glob_pattern": "pattern",
+}
+
 
 def _tool_name_key(name: str | None) -> str:
     return re.sub(r"[^a-z0-9_]+", "", (name or "").strip().lower())
@@ -625,6 +777,67 @@ def _required_keys_for_tool(name: str | None) -> tuple[str, ...]:
         if key.endswith(short) or key.endswith(f"_{short}"):
             return req
     return ()
+
+
+def _canonical_tool_arg_key(key: str) -> str:
+    raw = str(key or "").strip()
+    if not raw:
+        return raw
+    # Fold separators / camelCase to a stable alnum form for alias lookup.
+    # filePath / file_path / File-Path → filepath / file_path / filepath
+    folded_keep_us = re.sub(r"[^a-z0-9_]+", "", raw.lower())
+    folded_alnum = folded_keep_us.replace("_", "")
+    if folded_keep_us in _TOOL_ARG_KEY_ALIASES:
+        return _TOOL_ARG_KEY_ALIASES[folded_keep_us]
+    if folded_alnum in _TOOL_ARG_KEY_ALIASES:
+        return _TOOL_ARG_KEY_ALIASES[folded_alnum]
+    return raw
+
+
+def normalize_tool_argument_keys(obj: Any) -> Any:
+    """Rename common alternate tool-arg keys to Claude Code schema names.
+
+    Does not invent values — only remaps keys like path→file_path,
+    oldString→old_string. Existing canonical keys win over aliases.
+    """
+    if not isinstance(obj, dict):
+        return obj
+    out: dict[str, Any] = {}
+    for k, v in obj.items():
+        canon = _canonical_tool_arg_key(str(k))
+        # Prefer already-canonical / first non-empty value.
+        if canon in out:
+            old = out.get(canon)
+            if old in (None, "", [], {}) and v not in (None, "", [], {}):
+                out[canon] = v
+            continue
+        out[canon] = v
+    return out
+
+
+def normalize_tool_arguments_json(
+    raw: Any, *, tool_name: str | None = None
+) -> str:
+    """Sanitize + alias-normalize tool arguments JSON for readiness/emission."""
+    cleaned = sanitize_tool_arguments_json(raw)
+    if not cleaned or not str(cleaned).strip():
+        return cleaned
+    text = str(cleaned).strip()
+    if text[0] not in "{[":
+        return cleaned
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return cleaned
+    if not isinstance(parsed, dict):
+        return cleaned
+    normalized = normalize_tool_argument_keys(parsed)
+    if normalized == parsed:
+        return cleaned
+    try:
+        return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return cleaned
 
 
 def is_complete_tool_arguments_json(
@@ -649,7 +862,10 @@ def is_complete_tool_arguments_json(
     """
     if not s or not str(s).strip():
         return False
-    text = str(s).strip()
+    text = normalize_tool_arguments_json(s, tool_name=tool_name)
+    if not text or not str(text).strip():
+        return False
+    text = str(text).strip()
     if text[0] not in "{[":
         return False
     try:
@@ -683,16 +899,18 @@ def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
     if raw is None:
         return {}
     if isinstance(raw, dict):
-        return raw
+        return normalize_tool_argument_keys(raw)
     if isinstance(raw, list):
         return {"value": raw}
     if isinstance(raw, str):
-        cleaned = sanitize_tool_arguments_json(raw)
+        cleaned = normalize_tool_arguments_json(raw)
         if not cleaned:
             return {}
         try:
             parsed = json.loads(cleaned)
-            return parsed if isinstance(parsed, dict) else {"value": parsed}
+            if isinstance(parsed, dict):
+                return normalize_tool_argument_keys(parsed)
+            return {"value": parsed}
         except json.JSONDecodeError:
             return {"_raw": raw}
     return {"value": raw}
@@ -1060,6 +1278,12 @@ def anthropic_stream_message_stop() -> str:
 
 
 def anthropic_stream_error(message: str, err_type: str = "api_error") -> str:
+    """Emit Anthropic error event.
+
+    Prefer :func:`anthropic_stream_terminal_error` at the end of a stream so
+    clients also receive ``message_stop`` (sub2api treats a bare error without
+    a terminal stop as ``missing terminal event`` / hard disconnect).
+    """
     return _sse_event(
         "error",
         {
@@ -1067,6 +1291,16 @@ def anthropic_stream_error(message: str, err_type: str = "api_error") -> str:
             "error": {"type": err_type, "message": message},
         },
     )
+
+
+def anthropic_stream_terminal_error(
+    message: str, err_type: str = "api_error"
+) -> list[str]:
+    """Error + message_stop so secondary relays close the SSE envelope cleanly."""
+    return [
+        anthropic_stream_error(message, err_type=err_type),
+        anthropic_stream_message_stop(),
+    ]
 
 
 def anthropic_stream_ping() -> str:
@@ -1094,8 +1328,18 @@ def merge_tool_argument_delta(
     later file_path+old_string+new_string), prefer the richer later object and
     deep-merge dict keys so partial previews don't win forever.
     """
-    cur = sanitize_tool_arguments_json(current) if current else ""
-    piece = sanitize_tool_arguments_json(incoming) if incoming else ""
+    # Sanitize doubled blobs first, then alias-normalize keys so readiness checks
+    # see file_path/old_string even when the model sent path/oldString.
+    cur = (
+        normalize_tool_arguments_json(current, tool_name=tool_name)
+        if current
+        else ""
+    )
+    piece = (
+        normalize_tool_arguments_json(incoming, tool_name=tool_name)
+        if incoming
+        else ""
+    )
     if not piece:
         return cur
     if not cur:
@@ -1257,10 +1501,10 @@ class AnthropicStreamAssembler:
         return name
 
     @staticmethod
-    def _coerce_args_piece(raw: Any) -> str:
+    def _coerce_args_piece(raw: Any, *, tool_name: str | None = None) -> str:
         if raw is None:
             return ""
-        return sanitize_tool_arguments_json(raw)
+        return normalize_tool_arguments_json(raw, tool_name=tool_name)
 
     def _flush_tool_args(self, state: dict[str, Any]) -> list[str]:
         """Emit any not-yet-sent tool args (complete preferred; raw fallback)."""
@@ -1448,12 +1692,19 @@ class AnthropicStreamAssembler:
                     )
 
                 args_piece = None
+                _tn = state.get("name") or ""
                 if isinstance(fn, dict) and fn.get("arguments") is not None:
-                    args_piece = self._coerce_args_piece(fn.get("arguments"))
+                    args_piece = self._coerce_args_piece(
+                        fn.get("arguments"), tool_name=_tn
+                    )
                 elif raw.get("arguments") is not None:
-                    args_piece = self._coerce_args_piece(raw.get("arguments"))
+                    args_piece = self._coerce_args_piece(
+                        raw.get("arguments"), tool_name=_tn
+                    )
                 elif raw.get("input") is not None:
-                    args_piece = self._coerce_args_piece(raw.get("input"))
+                    args_piece = self._coerce_args_piece(
+                        raw.get("input"), tool_name=_tn
+                    )
                 if args_piece:
                     # Merge delta OR full re-send (double-proxy safe)
                     state["args"] = merge_tool_argument_delta(

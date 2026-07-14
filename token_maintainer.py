@@ -2,7 +2,7 @@
 
 - Normalize auth.json keys (CLI client_id → per-user multi-account)
 - Proactively refresh access tokens via refresh_token before expiry
-- Adaptive interval: refresh sooner when any token is near expiry
+- Adaptive interval / batch / skew: keep large pools warm without stampede
 - Batched / concurrency-capped cycles so large pools (700+) don't freeze WSL
 """
 
@@ -21,7 +21,8 @@ _last_run: dict[str, Any] = {}
 _wakeup = threading.Event()  # force an early cycle from admin UI
 _force_next = False
 _force_lock = threading.Lock()
-_min_remaining_cache: dict[str, Any] = {"at": 0.0, "value": None}
+# Cache both min remaining and near-expiry pressure counts (one pool scan).
+_remaining_stats_cache: dict[str, Any] = {"at": 0.0, "stats": None}
 _MIN_REMAINING_CACHE_TTL = 15.0
 
 
@@ -49,29 +50,145 @@ def _startup_delay() -> float:
         return 45.0
 
 
-def _min_remaining_seconds(*, force: bool = False) -> float | None:
-    """Smallest access-token remaining lifetime across live accounts."""
+def _remaining_stats(*, force: bool = False) -> dict[str, Any]:
+    """One-pass pool scan: min remaining + urgency buckets for adaptive scheduling."""
     now = time.time()
     if (
         not force
-        and _min_remaining_cache.get("at")
-        and now - float(_min_remaining_cache["at"]) < _MIN_REMAINING_CACHE_TTL
+        and _remaining_stats_cache.get("at")
+        and now - float(_remaining_stats_cache["at"]) < _MIN_REMAINING_CACHE_TTL
+        and isinstance(_remaining_stats_cache.get("stats"), dict)
     ):
-        return _min_remaining_cache.get("value")  # type: ignore[return-value]
+        return dict(_remaining_stats_cache["stats"])  # type: ignore[arg-type]
+
+    stats: dict[str, Any] = {
+        "min_remaining_sec": None,
+        "live": 0,
+        "expired": 0,
+        "le_15m": 0,
+        "le_30m": 0,
+        "le_60m": 0,
+        "need_refresh": 0,
+    }
     try:
         from auth import list_live_credentials
 
         remains: list[float] = []
         for c in list_live_credentials(include_expired=True, auto_refresh=False):
+            stats["live"] = int(stats["live"]) + 1
             if c.expires_at is None:
                 continue
-            remains.append(float(c.expires_at) - now)
-        value = min(remains) if remains else None
+            rem = float(c.expires_at) - now
+            remains.append(rem)
+            if rem <= 0:
+                stats["expired"] = int(stats["expired"]) + 1
+            if rem <= 15 * 60:
+                stats["le_15m"] = int(stats["le_15m"]) + 1
+            if rem <= 30 * 60:
+                stats["le_30m"] = int(stats["le_30m"]) + 1
+            if rem <= 60 * 60:
+                stats["le_60m"] = int(stats["le_60m"]) + 1
+        if remains:
+            stats["min_remaining_sec"] = min(remains)
+        # "Need refresh soon" ≈ already expired + within 30m. Used for batch sizing.
+        stats["need_refresh"] = int(stats["expired"]) + max(
+            0, int(stats["le_30m"]) - int(stats["expired"])
+        )
     except Exception:
-        value = None
-    _min_remaining_cache["at"] = now
-    _min_remaining_cache["value"] = value
-    return value
+        pass
+
+    _remaining_stats_cache["at"] = now
+    _remaining_stats_cache["stats"] = dict(stats)
+    return stats
+
+
+def _min_remaining_seconds(*, force: bool = False) -> float | None:
+    """Smallest access-token remaining lifetime across live accounts."""
+    rem = _remaining_stats(force=force).get("min_remaining_sec")
+    try:
+        return float(rem) if rem is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _adaptive_batch(*, force: bool = False, rem: float | None = None) -> int:
+    """Scale per-cycle refresh batch with pool pressure (still hard-capped)."""
+    try:
+        from config import TOKEN_REFRESH_BATCH
+    except Exception:
+        TOKEN_REFRESH_BATCH = 40
+    base = max(1, int(TOKEN_REFRESH_BATCH or 40))
+    stats = _remaining_stats(force=True)
+    if rem is None:
+        rem = stats.get("min_remaining_sec")
+        try:
+            rem = float(rem) if rem is not None else None
+        except (TypeError, ValueError):
+            rem = None
+
+    expired = int(stats.get("expired") or 0)
+    le15 = int(stats.get("le_15m") or 0)
+    le30 = int(stats.get("le_30m") or 0)
+    le60 = int(stats.get("le_60m") or 0)
+    live = max(0, int(stats.get("live") or 0))
+
+    # Admin force: larger but still capped — never rewrite whole 3k pool at once.
+    if force:
+        return min(max(base * 3, 60), 160)
+
+    # Expired tokens first: recover quickly.
+    if expired > 0 or (rem is not None and rem <= 0):
+        target = max(base * 2, expired, 40)
+        return min(int(target), 120)
+
+    # Wave of near-expiry tokens (common after bulk register/import).
+    # Aim to clear ~15–30m window within a few cycles, not hours.
+    pressure = max(le15, le30 // 2, le60 // 6)
+    if pressure >= base:
+        # e.g. 200 due soon with base=40 → batch ~80–100
+        target = max(base, min(pressure, base * 3))
+        # Large live pools can tolerate a bit more network concurrency.
+        if live >= 1500:
+            target = max(target, min(base * 2, 80))
+        return min(int(target), 120)
+
+    if le60 >= base * 2:
+        return min(max(base, base + base // 2), 80)
+
+    return base
+
+
+def _adaptive_skew(*, force: bool = False) -> float:
+    """Background refresh horizon.
+
+    Request-path skew stays small (TOKEN_REFRESH_SKEW). Background uses a wider
+    window so large pools refresh *before* expiry waves hit the request path.
+    """
+    base_skew = max(120.0, _skew())
+    # Historical floor: 15 minutes. Large pools need earlier pre-warm.
+    skew = max(900.0, base_skew * 4)
+    if force:
+        return 365 * 86400.0
+
+    stats = _remaining_stats(force=False)
+    live = int(stats.get("live") or 0)
+    le30 = int(stats.get("le_30m") or 0)
+    le60 = int(stats.get("le_60m") or 0)
+
+    # 3k-class pools: refresh up to ~45m early so batch cadence can keep up.
+    if live >= 1500:
+        skew = max(skew, 45 * 60)
+    elif live >= 500:
+        skew = max(skew, 30 * 60)
+
+    # If a large fraction is already inside 1h, widen further to smooth the wave.
+    if live > 0 and le60 >= max(40, live // 20):
+        skew = max(skew, 45 * 60)
+    if live > 0 and le30 >= max(20, live // 30):
+        skew = max(skew, 40 * 60)
+
+    # Hard cap: don't burn refresh_token quota hours early.
+    return min(float(skew), 60 * 60)
 
 
 def _next_wait_seconds() -> float:
@@ -80,18 +197,35 @@ def _next_wait_seconds() -> float:
     expires_at gets refreshed automatically without manual clicks.
     """
     base = _interval()
-    rem = _min_remaining_seconds()
-    if rem is None:
+    stats = _remaining_stats()
+    rem = stats.get("min_remaining_sec")
+    try:
+        rem_f = float(rem) if rem is not None else None
+    except (TypeError, ValueError):
+        rem_f = None
+    expired = int(stats.get("expired") or 0)
+    le15 = int(stats.get("le_15m") or 0)
+    le30 = int(stats.get("le_30m") or 0)
+
+    if rem_f is None and expired <= 0:
         return base
+
     # Already expired (or past skew) → retry aggressively.
-    if rem <= 0:
+    if expired > 0 or (rem_f is not None and rem_f <= 0):
+        # Many expired → almost continuous recovery cycles.
+        if expired >= 40:
+            return min(base, 20.0)
         return min(base, 30.0)
-    # Within 15 minutes of expiry → check every 45s
-    if rem <= 15 * 60:
+
+    # Dense near-expiry wave → shorter cadence so adaptive batch can drain it.
+    if le15 >= 40:
+        return min(base, 30.0)
+    if rem_f is not None and rem_f <= 15 * 60:
         return min(base, 45.0)
-    # Within 1 hour → check every 2 minutes
-    if rem <= 3600:
-        return min(base, 120.0)
+    if le30 >= 80:
+        return min(base, 45.0)
+    if rem_f is not None and rem_f <= 3600:
+        return min(base, 90.0 if le30 >= 20 else 120.0)
     return base
 
 
@@ -126,9 +260,18 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
             from oidc_auth import normalize_auth_file_keys, refresh_all_accounts
 
             result["normalized"] = normalize_auth_file_keys()
+            # Reclaim free-usage cooldowns whose wall-clock TTL elapsed so they
+            # re-enter rotation without waiting for a successful model probe.
+            try:
+                import account_pool as _ap
+
+                expired = _ap.expire_due_cooldowns(limit=200)
+                result["expired_cooldowns"] = expired
+            except Exception as e:  # noqa: BLE001
+                result["expired_cooldowns"] = {"ok": False, "error": str(e)[:200]}
             # Opportunistic cleanup of permanently unusable accounts:
             # refresh_invalid marks, no-RT+no-access, no-RT+access-expired.
-            # Default soft-disable (keep credentials); hard delete only with env.
+            # Default hard-delete; soft-disable only when env opts out.
             try:
                 from oidc_auth import purge_refresh_invalid_accounts
 
@@ -145,28 +288,19 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                     "disabled": 0,
                     "error": str(e)[:200],
                 }
-            # force: still only-near-expiry=False, but max_accounts batch applies
-            # Background cycles use a generous skew so already-expired tokens are
-            # always candidates; near-expiry (~15m) is also included.
-            skew = max(900.0, _skew() * 4)
-            # force: refresh even far-from-expiry, but still batch-capped so one
-            # admin click never rewrites 700 accounts at once on WSL.
+            # Adaptive skew + batch: large pools pre-warm earlier and drain near-expiry
+            # waves faster, without one-shot rewriting the entire pool.
+            pre_stats = _remaining_stats(force=True)
+            rem = pre_stats.get("min_remaining_sec")
             try:
-                from config import TOKEN_REFRESH_BATCH
-            except Exception:
-                TOKEN_REFRESH_BATCH = 40
-            # Prefer larger batches when many tokens are already expired so the
-            # pool recovers faster instead of only refreshing 20-40/cycle.
-            rem = _min_remaining_seconds(force=True)
-            if force:
-                force_batch = min(max(TOKEN_REFRESH_BATCH * 2, 40), 120)
-            elif rem is not None and rem <= 0:
-                force_batch = min(max(TOKEN_REFRESH_BATCH * 2, 40), 100)
-            else:
-                force_batch = TOKEN_REFRESH_BATCH
+                rem = float(rem) if rem is not None else None
+            except (TypeError, ValueError):
+                rem = None
+            skew = _adaptive_skew(force=force)
+            force_batch = _adaptive_batch(force=force, rem=rem)
             refresh = refresh_all_accounts(
                 only_near_expiry=not force,
-                skew_seconds=skew if not force else 365 * 86400.0,
+                skew_seconds=skew,
                 max_accounts=force_batch,
                 # Background / force batch: strict non-repeat sweep so permanent
                 # refresh failures cannot monopolize every cycle.
@@ -218,7 +352,7 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                     f"failed={slim_refresh.get('failed')} "
                     f"deferred={slim_refresh.get('deferred')} "
                     f"deleted={slim_refresh.get('deleted') or slim_refresh.get('invalidated') or 0} "
-                    f"force={force}"
+                    f"batch={force_batch} skew={int(skew)}s force={force}"
                     + (
                         f" sweep=gen:{sw.get('generation')} "
                         f"covered={sw.get('covered')}/{sw.get('need_refresh')} "
@@ -229,6 +363,22 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                 )
             except Exception:
                 pass
+            # Surface adaptive knobs in status / health for operators.
+            result["adaptive"] = {
+                "batch": force_batch,
+                "skew_sec": float(skew),
+                "stats": {
+                    k: pre_stats.get(k)
+                    for k in (
+                        "live",
+                        "expired",
+                        "le_15m",
+                        "le_30m",
+                        "le_60m",
+                        "need_refresh",
+                    )
+                },
+            }
         except Exception as e:  # noqa: BLE001
             result["ok"] = False
             result["error"] = str(e)[:400]
@@ -453,6 +603,15 @@ def status(*, light: bool = False) -> dict[str, Any]:
                 pass
     except Exception:
         pass
+    # Adaptive values help operators verify large-pool tuning without reading logs.
+    try:
+        adaptive_skew = _adaptive_skew(force=False)
+    except Exception:
+        adaptive_skew = max(900.0, _skew() * 4)
+    try:
+        adaptive_batch = _adaptive_batch(force=False)
+    except Exception:
+        adaptive_batch = TOKEN_REFRESH_BATCH
     out = {
         "running": bool(cluster_running),
         "local_running": local_running,
@@ -463,9 +622,11 @@ def status(*, light: bool = False) -> dict[str, Any]:
         "enabled": is_enabled(),
         "interval_sec": _interval(),
         "refresh_skew_sec": _skew(),
+        "background_skew_sec": adaptive_skew,
         "startup_delay_sec": _startup_delay(),
         "refresh_workers": TOKEN_REFRESH_WORKERS,
         "refresh_batch": TOKEN_REFRESH_BATCH,
+        "adaptive_batch": adaptive_batch,
     }
     last = dict(_last_run) if _last_run else None
     # Non-leader workers: read mirrored last_run from Redis.
@@ -532,6 +693,13 @@ def status(*, light: bool = False) -> dict[str, Any]:
                         "sweep",
                     )
                 }
+            adaptive = last.get("adaptive")
+            if isinstance(adaptive, dict):
+                adaptive = {
+                    k: v
+                    for k, v in adaptive.items()
+                    if k in ("batch", "skew_sec", "stats")
+                }
             out["last"] = {
                 "ok": last.get("ok"),
                 "at": last.get("at"),
@@ -545,6 +713,7 @@ def status(*, light: bool = False) -> dict[str, Any]:
                 if last.get("next_wait_sec") is not None
                 else next_wait,
                 "refresh": refresh,
+                "adaptive": adaptive,
             }
         else:
             out["last"] = None

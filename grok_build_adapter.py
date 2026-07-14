@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-14-reg-tasklog-restore-1"
+ADAPTER_BUILD = "2026-07-14-local-solver-wait-1"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -60,6 +60,16 @@ LOCAL_SOLVER_URL = (
 # Batch count is intentionally uncapped — only concurrency bounds parallelism.
 MAX_CONCURRENCY = int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "10") or 10)
 DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "3") or 3)
+
+# When captcha_provider=local, registration must wait for the inline Turnstile
+# Solver HTTP to answer before spawning workers. Prevents "already running but
+# captcha always fails because solver is still booting / restarting".
+LOCAL_SOLVER_WAIT_SEC = float(
+    os.environ.get("GROK2API_LOCAL_SOLVER_WAIT_SEC", "120") or 120
+)
+LOCAL_SOLVER_POLL_SEC = float(
+    os.environ.get("GROK2API_LOCAL_SOLVER_POLL_SEC", "1.0") or 1.0
+)
 
 # --------------------------------------------------------------------------- #
 # session state
@@ -472,6 +482,189 @@ def ensure_xconsole() -> None:
     _xconsole_error = None
 
 
+def _local_solver_base_url(url: str | None = None) -> str:
+    """Always pin local captcha to the in-container inline solver."""
+    raw = (
+        (url or "").strip()
+        or (LOCAL_SOLVER_URL or "").strip()
+        or os.environ.get("GROK2API_LOCAL_SOLVER_URL")
+        or os.environ.get("LOCAL_SOLVER_URL")
+        or "http://127.0.0.1:5072"
+    ).strip().rstrip("/")
+    # Registration must never hit an external "local" URL; force loopback.
+    if (
+        not raw
+        or "127.0.0.1" not in raw
+        and "localhost" not in raw
+    ):
+        return "http://127.0.0.1:5072"
+    return raw
+
+
+def probe_local_solver(
+    url: str | None = None,
+    *,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    """Probe inline Turnstile Solver readiness.
+
+    HTTP up is enough to accept createTask (lazy browser mode warms on first
+    solve). We prefer ``/health`` but also accept ``/`` returning any HTTP body.
+    """
+    base = _local_solver_base_url(url)
+    out: dict[str, Any] = {
+        "ok": False,
+        "ready": False,
+        "url": base,
+        "http_up": False,
+        "lazy": None,
+        "pool_ready": None,
+        "error": None,
+        "status_code": None,
+    }
+    try:
+        import urllib.error
+        import urllib.request
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"urllib unavailable: {e}"
+        return out
+
+    # 1) /health — structured
+    try:
+        req = urllib.request.Request(
+            f"{base}/health",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=max(0.5, float(timeout))) as resp:
+            out["status_code"] = int(getattr(resp, "status", 200) or 200)
+            body = resp.read().decode("utf-8", errors="replace")
+        out["http_up"] = True
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            out["lazy"] = data.get("lazy")
+            out["pool_ready"] = data.get("pool_ready")
+            # Solver process is ready when /health answers ok=true.
+            # pool_ready may still be false under TURNSTILE_LAZY=1 — that is OK;
+            # browsers warm on the first captcha task.
+            if data.get("ok") is False:
+                out["error"] = f"solver health ok=false body={body[:200]}"
+            else:
+                out["ok"] = True
+                out["ready"] = True
+                return out
+        else:
+            out["ok"] = True
+            out["ready"] = True
+            return out
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"health: {e}"
+
+    # 2) fallback: any response from /
+    try:
+        req = urllib.request.Request(f"{base}/", method="GET")
+        with urllib.request.urlopen(req, timeout=max(0.5, float(timeout))) as resp:
+            out["status_code"] = int(getattr(resp, "status", 200) or 200)
+            _ = resp.read(256)
+        out["http_up"] = True
+        out["ok"] = True
+        out["ready"] = True
+        out["error"] = None
+        return out
+    except Exception as e:  # noqa: BLE001
+        if not out.get("error"):
+            out["error"] = f"root: {e}"
+        else:
+            out["error"] = f"{out['error']}; root: {e}"
+        return out
+
+
+def wait_for_local_solver(
+    url: str | None = None,
+    *,
+    timeout_sec: float | None = None,
+    poll_sec: float | None = None,
+    progress: Any | None = None,
+) -> dict[str, Any]:
+    """Block until local Turnstile Solver is HTTP-ready, or fail.
+
+    Used by registration start so workers never race a still-booting solver.
+    """
+    base = _local_solver_base_url(url)
+    try:
+        wait_s = float(
+            timeout_sec
+            if timeout_sec is not None
+            else LOCAL_SOLVER_WAIT_SEC
+        )
+    except (TypeError, ValueError):
+        wait_s = 120.0
+    wait_s = max(1.0, min(wait_s, 600.0))
+    try:
+        every = float(
+            poll_sec if poll_sec is not None else LOCAL_SOLVER_POLL_SEC
+        )
+    except (TypeError, ValueError):
+        every = 1.0
+    every = max(0.2, min(every, 5.0))
+
+    deadline = time.time() + wait_s
+    last: dict[str, Any] = {
+        "ok": False,
+        "ready": False,
+        "url": base,
+        "waited_sec": 0.0,
+        "error": "not started",
+    }
+    started = time.time()
+    attempt = 0
+    while True:
+        attempt += 1
+        last = probe_local_solver(base, timeout=min(2.0, every + 0.5))
+        last["waited_sec"] = round(time.time() - started, 2)
+        last["attempts"] = attempt
+        last["url"] = base
+        if last.get("ready"):
+            last["ok"] = True
+            if progress:
+                try:
+                    progress(
+                        f"本地过盾已就绪 url={base} waited={last['waited_sec']}s"
+                    )
+                except Exception:
+                    pass
+            return last
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        msg = (
+            f"等待本地过盾就绪… url={base} "
+            f"attempt={attempt} left={remaining:.0f}s "
+            f"err={last.get('error') or 'down'}"
+        )
+        if progress:
+            try:
+                progress(msg)
+            except Exception:
+                pass
+        if attempt == 1 or attempt % 5 == 0:
+            print(f"[grok-build-auth] {msg}")
+        time.sleep(min(every, max(0.2, remaining)))
+
+    last["ok"] = False
+    last["ready"] = False
+    last["error"] = (
+        f"本地过盾服务未在 {wait_s:.0f}s 内就绪 "
+        f"(url={base}; last={last.get('error') or 'unreachable'}). "
+        f"请确认 inline Turnstile Solver 已启动（entrypoint / TURNSTILE_PORT），"
+        f"或稍后重试注册。"
+    )
+    return last
+
+
 def registration_available() -> dict[str, Any]:
     """Non-raising health probe for admin UI / startup logs."""
     moemail_configured = bool(
@@ -492,16 +685,20 @@ def registration_available() -> dict[str, Any]:
     ).strip().lower()
     if provider not in {"local", "yescaptcha"}:
         provider = "local"
-    local_url = (
+    local_url = _local_solver_base_url(
         LOCAL_SOLVER_URL
         or os.environ.get("GROK2API_LOCAL_SOLVER_URL")
         or os.environ.get("LOCAL_SOLVER_URL")
         or ""
-    ).strip().rstrip("/")
+    )
     captcha_ready = bool(local_url) if provider == "local" else bool(YESCAPTCHA_KEY)
+    local_solver_live: dict[str, Any] | None = None
+    if provider == "local":
+        local_solver_live = probe_local_solver(local_url, timeout=1.2)
+        captcha_ready = bool(local_solver_live.get("ready"))
     try:
         ensure_xconsole()
-        return {
+        out = {
             "ok": True,
             "available": True,
             "engine": "dongguatanglinux/grok-build-auth",
@@ -511,9 +708,16 @@ def registration_available() -> dict[str, Any]:
             "captcha_provider": provider,
             "local_solver_url": local_url,
             "local_solver_configured": bool(local_url),
-            "yescaptcha_configured": captcha_ready if provider == "local" else bool(YESCAPTCHA_KEY),
+            "local_solver_ready": (
+                bool(local_solver_live.get("ready")) if local_solver_live else None
+            ),
+            "local_solver_probe": local_solver_live,
+            "yescaptcha_configured": (
+                captcha_ready if provider == "local" else bool(YESCAPTCHA_KEY)
+            ),
             "moemail_configured": moemail_configured,
         }
+        return out
     except Exception as e:  # noqa: BLE001
         return {
             "ok": False,
@@ -526,7 +730,13 @@ def registration_available() -> dict[str, Any]:
             "captcha_provider": provider,
             "local_solver_url": local_url,
             "local_solver_configured": bool(local_url),
-            "yescaptcha_configured": captcha_ready if provider == "local" else bool(YESCAPTCHA_KEY),
+            "local_solver_ready": (
+                bool(local_solver_live.get("ready")) if local_solver_live else None
+            ),
+            "local_solver_probe": local_solver_live,
+            "yescaptcha_configured": (
+                captcha_ready if provider == "local" else bool(YESCAPTCHA_KEY)
+            ),
             "moemail_configured": moemail_configured,
         }
 
@@ -685,11 +895,66 @@ def _make_email_receiver(
 
 
 def _proxy_url() -> str:
-    from moemail import normalize_proxy_config
-    from config import XAI_PROXY
+    """Pick one proxy from the configured pool (env / registration config)."""
+    try:
+        from proxy_pool import resolve_proxy_for_request
 
-    cfg = normalize_proxy_config(XAI_PROXY or None)
-    return cfg["proxy"] if cfg else ""
+        return resolve_proxy_for_request(fallback_env=True) or ""
+    except Exception:
+        try:
+            from moemail import normalize_proxy_config
+            from config import XAI_PROXY
+
+            cfg = normalize_proxy_config(XAI_PROXY or None)
+            return cfg["proxy"] if cfg else ""
+        except Exception:
+            return ""
+
+
+def _proxy_pool(
+    proxy_text: str | None = None,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+) -> list[str]:
+    """Parse multi-line proxy text into full proxy URLs."""
+    try:
+        from proxy_pool import parse_proxy_pool
+
+        pool = parse_proxy_pool(
+            proxy_text,
+            username=username,
+            password=password,
+            fallback_env=True,
+        )
+        if pool:
+            return pool
+    except Exception:
+        pass
+    # Fallback: treat as single proxy via classic normalizer.
+    one = (proxy_text or "").strip() or _proxy_url()
+    return [one] if one else []
+
+
+def _pick_proxy_from_pool(
+    pool: list[str],
+    *,
+    strategy: str | None = None,
+    index: int | None = None,
+) -> str:
+    try:
+        from proxy_pool import pick_proxy, normalize_proxy_strategy
+
+        strat = strategy
+        if not strat:
+            try:
+                from config import XAI_PROXY_STRATEGY as _strat
+            except Exception:
+                _strat = "round_robin"
+            strat = _strat
+        return pick_proxy(pool, strategy=normalize_proxy_strategy(strat), index=index) or ""
+    except Exception:
+        return pool[0] if pool else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -841,6 +1106,9 @@ def start_registration(
     local_solver_url: str | None = None,
     yescaptcha_key: str | None = None,
     proxy: str | None = None,
+    proxy_username: str | None = None,
+    proxy_password: str | None = None,
+    proxy_strategy: str | None = None,
     moemail_api_key: str | None = None,
     moemail_base_url: str | None = None,
     prefix: str | None = None,
@@ -857,6 +1125,9 @@ def start_registration(
     ``count`` > 1 enables batch mode. ``concurrency`` is the real in-flight
     limit: e.g. concurrency=3 means only 3 accounts register at the same time;
     when one finishes, the next queued account starts.
+
+    ``proxy`` may be a single URL or a multi-line proxy pool. Each registration
+    job picks one entry via ``proxy_strategy`` (round_robin / random / sticky).
     """
     try:
         ensure_xconsole()
@@ -893,7 +1164,7 @@ def start_registration(
 
     if provider == "local":
         # Always inline in main container; ignore any external/custom URL.
-        solver_url = "http://127.0.0.1:5072"
+        solver_url = _local_solver_base_url(local_solver_url)
         try:
             globals()["LOCAL_SOLVER_URL"] = solver_url
         except Exception:
@@ -903,6 +1174,16 @@ def start_registration(
         os.environ["GROK2API_YESCAPTCHA_ENDPOINT"] = solver_url
         os.environ["YESCAPTCHA_ENDPOINT"] = solver_url
         key = "local"
+        # Gate: never spawn registration workers before the inline solver answers.
+        # Lazy browser mode is fine (pool_ready may be false); HTTP /health is enough.
+        solver_wait = wait_for_local_solver(solver_url)
+        if not solver_wait.get("ready"):
+            return {
+                "ok": False,
+                "error": solver_wait.get("error")
+                or f"本地过盾未就绪: {solver_url}",
+                "local_solver": solver_wait,
+            }
     else:
         # Cloud YesCaptcha must not inherit local solver endpoint/key.
         try:
@@ -961,7 +1242,18 @@ def start_registration(
         stagger = 400
     stagger = max(0, min(stagger, 10_000))
 
-    proxy_val = (proxy or _proxy_url() or "").strip()
+    # Build proxy pool once; each job picks one URL (rotation / random / sticky).
+    proxy_pool = _proxy_pool(
+        proxy,
+        username=proxy_username,
+        password=proxy_password,
+    )
+    try:
+        from config import XAI_PROXY_STRATEGY as _default_strat
+    except Exception:
+        _default_strat = "round_robin"
+    proxy_strat = (proxy_strategy or _default_strat or "round_robin").strip().lower()
+    proxy_val = _pick_proxy_from_pool(proxy_pool, strategy=proxy_strat, index=0)
     try:
         from moemail import normalize_mail_provider as _norm_mail
 
@@ -983,10 +1275,12 @@ def start_registration(
         )
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
+    # Snapshot keeps the full multi-line text so resume / UI can re-parse the pool.
+    proxy_snapshot = (proxy or "\n".join(proxy_pool) or proxy_val or "").strip()
     reg_cfg = _snapshot_reg_config(
         captcha_provider=provider,
         yescaptcha_key=key,
-        proxy=proxy_val,
+        proxy=proxy_snapshot,
         moemail_api_key=moemail_api_key,
         moemail_base_url=moemail_base_url,
         prefix=prefix,
@@ -996,6 +1290,8 @@ def start_registration(
         stagger_ms=stagger,
         mail_provider=mail_prov,
     )
+    reg_cfg["proxy_strategy"] = proxy_strat
+    reg_cfg["proxy_pool_count"] = len(proxy_pool)
     batch = {
         "id": batch_id,
         "status": "running",
@@ -1047,7 +1343,8 @@ def start_registration(
         stagger_ms=stagger,
         captcha_provider=provider,
         yescaptcha_key=key,
-        proxy=proxy_val,
+        proxy=proxy_snapshot,
+        proxy_strategy=proxy_strat,
         moemail_api_key=moemail_api_key,
         moemail_base_url=moemail_base_url,
         prefix=prefix,
@@ -1093,6 +1390,7 @@ def _spawn_batch_runner(
     captcha_provider: str,
     yescaptcha_key: str,
     proxy: str,
+    proxy_strategy: str | None = None,
     moemail_api_key: str | None,
     moemail_base_url: str | None,
     prefix: str | None,
@@ -1140,7 +1438,7 @@ def _spawn_batch_runner(
     key = (yescaptcha_key or "").strip()
     if provider == "local":
         key = "local"
-        solver_url = "http://127.0.0.1:5072"
+        solver_url = _local_solver_base_url(None)
         try:
             globals()["CAPTCHA_PROVIDER"] = "local"
             globals()["LOCAL_SOLVER_URL"] = solver_url
@@ -1152,6 +1450,16 @@ def _spawn_batch_runner(
         os.environ["LOCAL_SOLVER_URL"] = solver_url
         os.environ["GROK2API_YESCAPTCHA_ENDPOINT"] = solver_url
         os.environ["YESCAPTCHA_ENDPOINT"] = solver_url
+        solver_wait = wait_for_local_solver(solver_url)
+        if not solver_wait.get("ready"):
+            _release_batch_runner(bid, lock_token)
+            return {
+                "ok": False,
+                "error": solver_wait.get("error")
+                or f"本地过盾未就绪: {solver_url}",
+                "batch_id": bid,
+                "local_solver": solver_wait,
+            }
     else:
         if not key:
             _release_batch_runner(bid, lock_token)
@@ -1175,7 +1483,14 @@ def _spawn_batch_runner(
         ):
             os.environ.pop(k, None)
 
-    proxy_val = (proxy or "").strip()
+    # `proxy` may be multi-line pool text; expand once for this runner.
+    proxy_pool = _proxy_pool(proxy)
+    try:
+        from config import XAI_PROXY_STRATEGY as _default_strat
+    except Exception:
+        _default_strat = "round_robin"
+    proxy_strat = (proxy_strategy or _default_strat or "round_robin").strip().lower()
+    proxy_snapshot = (proxy or "\n".join(proxy_pool) or "").strip()
     workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), MAX_CONCURRENCY, remaining))
     stagger = max(0, min(int(stagger_ms or 400), 10_000))
 
@@ -1191,7 +1506,7 @@ def _spawn_batch_runner(
         b["reg_config"] = _snapshot_reg_config(
             captcha_provider=provider,
             yescaptcha_key=key,
-            proxy=proxy_val,
+            proxy=proxy_snapshot,
             moemail_api_key=moemail_api_key,
             moemail_base_url=moemail_base_url,
             prefix=prefix,
@@ -1201,8 +1516,13 @@ def _spawn_batch_runner(
             stagger_ms=stagger,
             mail_provider=mail_provider,
         )
+        b["reg_config"]["proxy_strategy"] = proxy_strat
+        b["reg_config"]["proxy_pool_count"] = len(proxy_pool)
         b["updated_at"] = _now()
-        b["message"] = f"starting remaining={remaining} threads={workers}"
+        b["message"] = (
+            f"starting remaining={remaining} threads={workers}"
+            + (f" proxies={len(proxy_pool)}" if proxy_pool else "")
+        )
         b["finished"] = 0
         b["ok_count"] = 0
         b["fail_count"] = 0
@@ -1314,11 +1634,15 @@ def _spawn_batch_runner(
                     "status": "cancelled",
                     "error": "cancelled before start",
                 }
+            # One proxy per registration job (pool rotation / random / sticky).
+            job_proxy = _pick_proxy_from_pool(
+                proxy_pool, strategy=proxy_strat, index=max(0, int(i) - 1)
+            )
             # Small per-slot stagger only (not cumulative across the whole batch).
             delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
             prepared = _prepare_registration_session(
                 yescaptcha_key=key,
-                proxy=proxy_val,
+                proxy=job_proxy,
                 moemail_api_key=moemail_api_key,
                 moemail_base_url=moemail_base_url,
                 prefix=prefix,
@@ -1368,7 +1692,7 @@ def _spawn_batch_runner(
             if not sid or receiver is None:
                 return {"ok": False, "error": "registration session prepare failed", "id": sid}
             try:
-                _run_registration(sid, key, proxy_val or "", receiver)
+                _run_registration(sid, key, job_proxy or "", receiver)
             finally:
                 with _lock:
                     if sid in _sessions:
@@ -1754,9 +2078,21 @@ def _run_registration(
 
         if provider == "local":
             # Always use in-container inline solver; ignore external/custom URL.
-            endpoint = "http://127.0.0.1:5072"
+            endpoint = _local_solver_base_url(None)
             solver_key = "local"
             auto_fallback = False
+            # Re-check right before first solve so a mid-batch solver restart
+            # doesn't burn mailboxes while HTTP is still down.
+            wait = wait_for_local_solver(
+                endpoint,
+                timeout_sec=min(60.0, max(5.0, LOCAL_SOLVER_WAIT_SEC)),
+                progress=lambda m: update("waiting_solver", m),
+            )
+            if not wait.get("ready"):
+                raise RuntimeError(
+                    wait.get("error")
+                    or f"本地过盾未就绪，无法开始打码: {endpoint}"
+                )
         else:
             # Cloud YesCaptcha only; never inherit local solver endpoint.
             endpoint = (
@@ -2202,7 +2538,7 @@ def _run_registration(
                 f"adapter_build={ADAPTER_BUILD}"
             )
         # Registration import is durable PostgreSQL (accounts + account_pool).
-        # auth.json is only an optional mirror for export tools.
+        # auth.json is not written at runtime in hybrid mode (export-only).
         if import_result.get("storage") and import_result.get("storage") != "postgres":
             print(
                 f"[grok-build-auth] WARN: import storage={import_result.get('storage')} "

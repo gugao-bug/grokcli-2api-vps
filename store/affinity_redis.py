@@ -13,71 +13,104 @@ def _k(fp: str) -> str:
     return key("affinity", fp)
 
 
-def get(fingerprint: str, *, ttl_sec: float) -> str | None:
-    if not redis_enabled() or not fingerprint:
-        return None
-    raw = get_str(_k(fingerprint))
+def _parse_entry(raw: str | None) -> dict[str, Any] | None:
     if not raw:
         return None
     account_id: str | None = None
     hits = 0
     bound_at = time.time()
+    session_fp: str | None = None
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
             account_id = str(data.get("account_id") or "") or None
             hits = int(data.get("hits") or 0)
             bound_at = float(data.get("bound_at") or bound_at)
+            sfp = data.get("session_fp")
+            if sfp:
+                session_fp = str(sfp)
         else:
             account_id = str(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
         account_id = str(raw)
     if not account_id:
         return None
-    # touch: refresh TTL + hits
-    payload = {
+    out: dict[str, Any] = {
+        "account_id": account_id,
+        "hits": hits,
+        "bound_at": bound_at,
+    }
+    if session_fp:
+        out["session_fp"] = session_fp
+    return out
+
+
+def get_entry(fingerprint: str, *, ttl_sec: float) -> dict[str, Any] | None:
+    """Return full affinity entry and refresh TTL/hits."""
+    if not redis_enabled() or not fingerprint:
+        return None
+    raw = get_str(_k(fingerprint))
+    entry = _parse_entry(raw)
+    if not entry:
+        return None
+    account_id = entry["account_id"]
+    hits = int(entry.get("hits") or 0)
+    bound_at = float(entry.get("bound_at") or time.time())
+    payload: dict[str, Any] = {
         "account_id": account_id,
         "bound_at": bound_at,
         "last_seen": time.time(),
         "hits": hits + 1,
     }
+    sfp = entry.get("session_fp")
+    if sfp:
+        payload["session_fp"] = sfp
     set_ex(_k(fingerprint), json.dumps(payload, separators=(",", ":")), ttl_sec)
-    return account_id
+    return payload
 
 
-def bind(fingerprint: str, account_id: str, *, ttl_sec: float) -> None:
+def get(fingerprint: str, *, ttl_sec: float) -> str | None:
+    entry = get_entry(fingerprint, ttl_sec=ttl_sec)
+    if not entry:
+        return None
+    return str(entry.get("account_id") or "") or None
+
+
+def bind(
+    fingerprint: str,
+    account_id: str,
+    *,
+    ttl_sec: float,
+    session_fp: str | None = None,
+) -> None:
     if not redis_enabled() or not fingerprint or not account_id:
         return
     now = time.time()
     prev_hits = 0
+    prev_session: str | None = None
+    prev_bound = now
     raw = get_str(_k(fingerprint))
     if raw:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                prev_hits = int(data.get("hits") or 0)
-                if data.get("account_id") == account_id:
-                    bound_at = float(data.get("bound_at") or now)
-                    payload = {
-                        "account_id": account_id,
-                        "bound_at": bound_at,
-                        "last_seen": now,
-                        "hits": prev_hits + 1,
-                    }
-                    set_ex(
-                        _k(fingerprint),
-                        json.dumps(payload, separators=(",", ":")),
-                        ttl_sec,
-                    )
-                    return
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
-    payload = {
+        prev = _parse_entry(raw)
+        if prev:
+            prev_hits = int(prev.get("hits") or 0)
+            prev_session = prev.get("session_fp")
+            if prev.get("account_id") == account_id:
+                prev_bound = float(prev.get("bound_at") or now)
+    sfp = (session_fp or "").strip() or prev_session
+    payload: dict[str, Any] = {
         "account_id": account_id,
-        "bound_at": now,
+        "bound_at": prev_bound if (prev_hits and raw) else now,
         "last_seen": now,
-        "hits": prev_hits + 1 if prev_hits else 1,
+        "hits": (prev_hits + 1) if prev_hits else 1,
     }
+    if raw:
+        prev = _parse_entry(raw)
+        if prev and prev.get("account_id") == account_id:
+            payload["bound_at"] = float(prev.get("bound_at") or now)
+            payload["hits"] = int(prev.get("hits") or 0) + 1
+    if sfp:
+        payload["session_fp"] = sfp
     set_ex(_k(fingerprint), json.dumps(payload, separators=(",", ":")), ttl_sec)
 
 
@@ -117,6 +150,11 @@ def status_sample(*, max_n: int = 8) -> dict[str, Any]:
                     "fp": fp[:12] + "…",
                     "account_id": str(data.get("account_id") or "")[:48],
                     "hits": data.get("hits"),
+                    "session_fp": (
+                        (str(data.get("session_fp") or "")[:16] + "…")
+                        if data.get("session_fp")
+                        else None
+                    ),
                     "age_sec": int(
                         time.time() - float(data.get("bound_at") or time.time())
                     ),

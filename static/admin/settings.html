@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.fd8289a708.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.1031c5bb2f.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -194,6 +194,42 @@
       <label class="g2a-check"><input type="checkbox" id="set-token-maintain" /> Token 自动续期</label>
       <label class="g2a-check"><input type="checkbox" id="set-model-health" /> 模型健康探测</label>
       <label class="g2a-check"><input type="checkbox" id="set-affinity" /> 会话粘性（同对话绑同一账号）</label>
+    </div>
+  </div>
+</section>
+
+<section class="g2a-card">
+  <div class="g2a-card-head">
+    <div>
+      <h3>账号出站代理池</h3>
+      <p>账号池请求上游（聊天 / 测活 / Token 续期）走代理。按账号粘性选代理，与会话粘性配合更稳。协议注册可共用同一列表，也可单独配置。</p>
+    </div>
+    <span id="outbound-proxy-pill" class="g2a-tag">—</span>
+  </div>
+  <div class="g2a-form-grid" style="display:grid;gap:14px;max-width:720px">
+    <div class="g2a-actions" style="flex-wrap:wrap;gap:16px">
+      <label class="g2a-check"><input type="checkbox" id="set-outbound-proxy-enabled" checked /> 启用出站代理池</label>
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="set-outbound-proxy" title="每行一个代理；支持 http/socks5 与 host:port:user:pass">代理池</label>
+      <textarea id="set-outbound-proxy" class="g2a-input" rows="4" spellcheck="false" placeholder="可选，每行一个代理&#10;http://host:port&#10;host:port:user:pass&#10;socks5://user:pass@host:port"></textarea>
+      <p class="g2a-muted" style="margin:4px 0 0" id="set-outbound-proxy-hint">未配置时直连上游。策略 round_robin 会对账号 ID 做稳定哈希（同账号固定出口）。</p>
+    </div>
+    <div class="g2a-field">
+      <label for="set-outbound-proxy-username">代理用户名</label>
+      <input id="set-outbound-proxy-username" type="text" class="g2a-input" placeholder="可选，共享认证" autocomplete="off" />
+    </div>
+    <div class="g2a-field">
+      <label for="set-outbound-proxy-password">代理密码</label>
+      <input id="set-outbound-proxy-password" type="password" class="g2a-input" placeholder="可选，共享认证" autocomplete="new-password" />
+    </div>
+    <div class="g2a-field">
+      <label for="set-outbound-proxy-strategy">代理策略</label>
+      <select id="set-outbound-proxy-strategy" class="g2a-input">
+        <option value="round_robin" selected>轮询/粘性哈希 (round_robin)</option>
+        <option value="random">随机 (random)</option>
+        <option value="sticky">固定首个 (sticky)</option>
+      </select>
     </div>
   </div>
 </section>
@@ -312,6 +348,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.09602ed3aa.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.03235a7d29.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

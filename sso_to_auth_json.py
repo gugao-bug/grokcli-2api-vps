@@ -55,8 +55,32 @@ AUTH_KEY = f"{OIDC_ISSUER}::{GROK_CLI_CLIENT_ID}"
 
 
 def _proxy_kwargs() -> dict:
-    """Return curl_cffi compatible proxy kwargs from env."""
-    proxy = os.getenv("GROK2API_PROXY") or os.getenv("GROK_CLI_PROXY") or ""
+    """Return curl_cffi compatible proxy kwargs from env / proxy pool."""
+    try:
+        from proxy_pool import resolve_proxy_for_request, curl_proxies_arg
+
+        url = resolve_proxy_for_request(fallback_env=True)
+        proxies = curl_proxies_arg(url)
+        if proxies:
+            return {"proxies": proxies}
+    except Exception:
+        pass
+    proxy = (
+        os.getenv("GROK2API_XAI_PROXY")
+        or os.getenv("GROK2API_PROXY")
+        or os.getenv("GROK_CLI_PROXY")
+        or ""
+    ).strip()
+    # Multi-line: take first non-empty line.
+    if "\n" in proxy or "\r" in proxy:
+        proxy = next(
+            (
+                ln.strip()
+                for ln in proxy.replace("\r", "\n").split("\n")
+                if ln.strip() and not ln.strip().startswith("#")
+            ),
+            "",
+        )
     if proxy:
         return {"proxies": {"http": proxy, "https": proxy}}
     return {}
