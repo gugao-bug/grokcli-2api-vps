@@ -1,0 +1,9 @@
+[Unit]
+Description=Update grokcli-2api from GitHub
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/grokcli-2api/scripts/vps-auto-update.sh
+TimeoutStartSec=3600

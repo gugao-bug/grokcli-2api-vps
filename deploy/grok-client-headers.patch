@@ -1,0 +1,99 @@
+diff --git a/auth.py b/auth.py
+index 30ede75..66bcc99 100644
+--- a/auth.py
++++ b/auth.py
+@@ -16,6 +16,7 @@ from config import (
+     CLI_VERSION,
+     CLIENT_IDENTIFIER,
+     CLIENT_SURFACE,
++    CLIENT_USER_AGENT,
+     TOKEN_REFRESH_SKEW,
+ )
+ from oidc_auth import parse_expires_at
+@@ -480,6 +481,6 @@ def upstream_headers(token: str, model: str) -> dict[str, str]:
+         "x-grok-client-version": CLI_VERSION,
+         "x-grok-client-surface": CLIENT_SURFACE,
+         "x-grok-client-identifier": CLIENT_IDENTIFIER,
+-        "User-Agent": f"grok-cli/{CLI_VERSION}",
++        "User-Agent": CLIENT_USER_AGENT,
+         "Accept": "text/event-stream, application/json",
+     }
+diff --git a/config.py b/config.py
+index f801622..410bef8 100644
+--- a/config.py
++++ b/config.py
+@@ -90,11 +90,12 @@ MODELS_CACHE = Path(
+     os.getenv("GROK2API_MODELS_CACHE", DATA_DIR / "models_cache.json")
+ )
+ 
+-# Client headers for upstream proxy (version string only — no local CLI binary)
+-# Keep surface as grok-cli so cli-chat-proxy accepts the session.
++# Client headers for upstream proxy (version string only — no local CLI binary).
++# Defaults mirror the current Grok Build CLI client validation contract.
+ CLI_VERSION = os.getenv("GROK2API_CLI_VERSION", "0.2.93")
+-CLIENT_SURFACE = os.getenv("GROK2API_CLIENT_SURFACE", "grok-cli")
++CLIENT_SURFACE = os.getenv("GROK2API_CLIENT_SURFACE", "grok-build")
+ CLIENT_IDENTIFIER = os.getenv("GROK2API_CLIENT_IDENTIFIER", "grokcli-2api")
++CLIENT_USER_AGENT = os.getenv("GROK2API_CLIENT_USER_AGENT", "grok-cli")
+ 
+ # Default model when client omits / sends generic names
+ DEFAULT_MODEL = os.getenv("GROK2API_DEFAULT_MODEL", "grok-4.5")
+diff --git a/grok-build-auth/xai_build_quota_probe.py b/grok-build-auth/xai_build_quota_probe.py
+index 798ec2b..2387f5c 100644
+--- a/grok-build-auth/xai_build_quota_probe.py
++++ b/grok-build-auth/xai_build_quota_probe.py
+@@ -24,8 +24,10 @@ import requests
+ 
+ DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+ DEFAULT_HEADERS = {
++    "User-Agent": "grok-cli",
+     "X-XAI-Token-Auth": "xai-grok-cli",
+     "x-grok-client-version": "0.2.93",
++    "x-grok-client-surface": "grok-build",
+     "x-grok-client-identifier": "grok-shell",
+ }
+ 
+@@ -144,7 +146,6 @@ def probe(path: Path, timeout: float, use_auth_base_url: bool = False) -> dict[s
+         "Authorization": f"Bearer {token}",
+         "Accept": "application/json",
+         "Content-Type": "application/json",
+-        "User-Agent": "grok-cli/0.2.93",
+         **DEFAULT_HEADERS,
+     }
+     extra = auth.get("headers")
+diff --git a/grok-build-auth/xconsole_client/xai_oauth.py b/grok-build-auth/xconsole_client/xai_oauth.py
+index b5d4504..1b2d124 100644
+--- a/grok-build-auth/xconsole_client/xai_oauth.py
++++ b/grok-build-auth/xconsole_client/xai_oauth.py
+@@ -56,8 +56,10 @@ DEFAULT_SCOPES = [
+ # chat proxy plus the same headers sent by the official @xai-official/grok CLI.
+ CLIPROXYAPI_GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+ CLIPROXYAPI_GROK_HEADERS = {
++    "User-Agent": "grok-cli",
+     "X-XAI-Token-Auth": "xai-grok-cli",
+     "x-grok-client-version": "0.2.93",
++    "x-grok-client-surface": "grok-build",
+     "x-grok-client-identifier": "grok-shell",
+ }
+ 
+diff --git a/models.py b/models.py
+index 48b7460..4cd5760 100644
+--- a/models.py
++++ b/models.py
+@@ -11,6 +11,7 @@ from config import (
+     CLI_VERSION,
+     CLIENT_IDENTIFIER,
+     CLIENT_SURFACE,
++    CLIENT_USER_AGENT,
+     DEFAULT_MODEL,
+     MODEL_ALIASES,
+     MODELS_CACHE,
+@@ -161,7 +162,7 @@ def _upstream_headers(token: str) -> dict[str, str]:
+         "x-grok-client-version": CLI_VERSION,
+         "x-grok-client-surface": CLIENT_SURFACE,
+         "x-grok-client-identifier": CLIENT_IDENTIFIER,
+-        "User-Agent": f"grok-cli/{CLI_VERSION}",
++        "User-Agent": CLIENT_USER_AGENT,
+         "Accept": "application/json",
+     }
+ 

@@ -1,0 +1,55 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+data/
+*.tmp
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# leftover / accidental trees
+register/
+vendors/
+
+# vendored registration runtime artifacts
+grok-build-auth/**/__pycache__/
+grok-build-auth/cliproxyapi_auth/
+grok-build-auth/.env
+data/register_sso/
+
+# Local deploy overrides (ports, domains, secrets paths)
+docker-compose.override.yml
+grokcli-2api.env
+docker-rebuild.local.sh
+
+# Local tooling / release pins
+.claude/
+.release-commit
+
+# Accidental local data dir name / backups
+GROK2API_DATA_DIR/
+*.bak
+auth.bak.*
+**/auth.bak.*
+
+# Never allow common secret / runtime filenames even outside data/
+**/auth.json
+**/keys.json
+**/models_cache.json
+**/affinity.json
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+
+# local turnstile solver runtime
+turnstile-solver/.venv/
+turnstile-solver/logs/
+turnstile-solver/keys/
+turnstile-solver/__pycache__/

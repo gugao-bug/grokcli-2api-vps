@@ -1,0 +1,115 @@
+services:
+  # Redis / Postgres are internal-only (no host port publish).
+  # App reaches them via the compose network: redis:6379 / postgres:5432.
+  redis:
+    image: redis:7-alpine
+    container_name: grokcli-2api-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: grokcli-2api-postgres
+    environment:
+      POSTGRES_USER: grok2api
+      POSTGRES_PASSWORD: grok2api
+      POSTGRES_DB: grok2api
+    volumes:
+      - grok2api_pg:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grok2api -d grok2api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Single app container: API + inline Turnstile Solver (same process tree)
+  grokcli-2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: grokcli-2api:local
+    container_name: grokcli-2api
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      # Only the app API is published. Postgres/Redis stay internal-only
+      # (compose network). Inline Turnstile Solver listens on container
+      # loopback 127.0.0.1:5072 and is NOT published to the host.
+      - "3000:3000"
+    shm_size: "1gb"
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      GROK2API_HOST: "0.0.0.0"
+      GROK2API_PORT: "3000"
+      GROK2API_OPEN_BROWSER: "0"
+      GROK2API_TOKEN_MAINTAIN: "1"
+      GROK2API_MODEL_HEALTH: "1"
+      GROK2API_REASONING_COMPAT: "off"
+      GROK2API_STORE_BACKEND: "hybrid"
+      # Multi-worker: default 2 (enough for hybrid; override via .env for large hosts)
+      GROK2API_WORKERS: "${GROK2API_WORKERS:-2}"
+      # In-stack service DNS (do not use 127.0.0.1 here)
+      REDIS_URL: "redis://redis:6379/0"
+      GROK2API_REDIS_URL: "redis://redis:6379/0"
+      DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+      GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+      # Inline local Turnstile Solver (same container)
+      GROK2API_CAPTCHA_PROVIDER: "${GROK2API_CAPTCHA_PROVIDER:-local}"
+      CAPTCHA_PROVIDER: "${CAPTCHA_PROVIDER:-local}"
+      GROK2API_LOCAL_SOLVER_URL: "${GROK2API_LOCAL_SOLVER_URL:-http://127.0.0.1:5072}"
+      LOCAL_SOLVER_URL: "${LOCAL_SOLVER_URL:-http://127.0.0.1:5072}"
+      GROK2API_INLINE_SOLVER: "${GROK2API_INLINE_SOLVER:-1}"
+      TURNSTILE_HOST: "127.0.0.1"
+      TURNSTILE_PORT: "5072"
+      # Align with registration concurrency (default 3)
+      GROK2API_REG_CONCURRENCY: "${GROK2API_REG_CONCURRENCY:-3}"
+      TURNSTILE_THREAD: "${TURNSTILE_THREAD:-${GROK2API_REG_CONCURRENCY:-3}}"
+      TURNSTILE_BROWSER_TYPE: "${TURNSTILE_BROWSER_TYPE:-camoufox}"
+      # Idle memory: warm browsers only when solving captcha; reclaim after quiet period
+      TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
+      TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
+    healthcheck:
+      # $$ keeps substitution inside the container so override ports (e.g. 40081) work
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-3000}/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 90s
+    volumes:
+      - ./data:/app/data
+      - ./turnstile-solver/logs:/app/turnstile-solver/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # Explicit aliases so external stacks (sub2api etc.) can resolve us after recreate
+    networks:
+      default:
+        aliases:
+          - grokcli-2api
+    restart: unless-stopped
+
+volumes:
+  grok2api_pg:
+
+# Fixed project network name so other compose stacks can join as external:
+#   networks:
+#     grokcli-net:
+#       name: grokcli-2api_default
+#       external: true
+# Downstream DNS: http://grokcli-2api:<port>/v1
+networks:
+  default:
+    name: grokcli-2api_default
+    driver: bridge
+    labels:
+      com.grokcli-2api.network: "shared-upstream"

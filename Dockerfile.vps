@@ -1,0 +1,30 @@
+FROM grokcli-2api:runtime-base
+
+ENV PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
+    PIP_TRUSTED_HOST=mirrors.cloud.tencent.com \
+    TURNSTILE_BROWSER_TYPE=camoufox
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+COPY requirements-store.txt /app/requirements-store.txt
+COPY turnstile-solver/requirements.txt /app/turnstile-solver-requirements.txt
+RUN python -m pip install --no-cache-dir -r /app/requirements.txt \
+    && python -m pip install --no-cache-dir -r /app/requirements-store.txt \
+    && python -m pip install --no-cache-dir -r /app/turnstile-solver-requirements.txt
+
+COPY . /app
+COPY entrypoint.vps.sh /app/entrypoint.sh
+COPY camoufox-ubo /root/.cache/camoufox/addons/UBO
+RUN chmod +x /app/entrypoint.sh \
+    && mkdir -p /app/turnstile-solver/logs /app/turnstile-solver/keys \
+    && printf '%s\n' 'http://privoxy:8118' > /app/turnstile-solver/proxies.txt \
+    && test -f /app/grok-build-auth/xconsole_client/client.py \
+    && test -f /app/grok_build_adapter.py \
+    && test -f /app/turnstile-solver/api_solver.py \
+    && python -c "import grok_build_adapter, app; print('build-check', app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD)"
+
+EXPOSE 3000 5072
+VOLUME ["/app/data"]
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "app.py"]
